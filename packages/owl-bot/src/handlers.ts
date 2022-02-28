@@ -13,23 +13,23 @@
 // limitations under the License.
 
 import {logger} from 'gcf-utils';
-import {createPullRequest} from 'code-suggester';
-import {dump} from 'js-yaml';
-import {
-  OwlBotLock,
-  owlBotLockFrom,
-  owlBotLockPath,
-  owlBotYamlFromText,
-  owlBotYamlPath,
-} from './config-files';
+import {OwlBotLock, OWL_BOT_LOCK_PATH} from './config-files';
 import {Configs, ConfigsStore} from './configs-store';
-import {getAuthenticatedOctokit, core} from './core';
-import {Octokit} from '@octokit/rest';
-import yaml from 'js-yaml';
+import {core} from './core';
 // Conflicting linters think the next line is extraneous or necessary.
 // eslint-disable-next-line node/no-extraneous-import
-import {Endpoints} from '@octokit/types';
-import {OctokitType} from './octokit-util';
+import {Endpoints, RequestError} from '@octokit/types';
+import {
+  OctokitType,
+  createIssueIfTitleDoesntExist,
+  OctokitFactory,
+} from './octokit-util';
+import {
+  GithubRepo,
+  githubRepo,
+  githubRepoFromOwnerSlashName,
+} from './github-repo';
+import {fetchConfigs} from './fetch-configs';
 
 type ListReposResponse = Endpoints['GET /orgs/{org}/repos']['response'];
 
@@ -51,10 +51,11 @@ export async function onPostProcessorPublished(
 ): Promise<void> {
   // Examine all the repos that use the specified docker image for post
   // processing.
-  const repos: [
-    string,
-    Configs
-  ][] = await configsStore.findReposWithPostProcessor(dockerImageName);
+  console.info(
+    `New docker image published: ${dockerImageName}.  Digest: ${dockerImageDigest}`
+  );
+  const repos: [string, Configs][] =
+    await configsStore.findReposWithPostProcessor(dockerImageName);
   for (const [repo, configs] of repos) {
     let stale = true;
     // The lock file may be missing, for example when a new repo is created.
@@ -73,90 +74,105 @@ export async function onPostProcessorPublished(
           image: dockerImageName,
         },
       };
-      const octokit = await getAuthenticatedOctokit({
-        privateKey,
-        appId,
-        installation: configs.installationId,
-      });
-      // TODO(bcoe): switch updatedAt to date from PubSub payload:
-      await createOnePullRequestForUpdatingLock(
+      if (!process.env.PROJECT_ID) {
+        throw Error('must set environment variable PROJECT_ID');
+      }
+      const project: string = process.env.PROJECT_ID;
+      if (!process.env.UPDATE_LOCK_BUILD_TRIGGER_ID) {
+        throw Error(
+          'must set environment variable UPDATE_LOCK_BUILD_TRIGGER_ID'
+        );
+      }
+      const triggerId: string = process.env.UPDATE_LOCK_BUILD_TRIGGER_ID;
+      await triggerOneBuildForUpdatingLock(
         configsStore,
-        octokit,
         repo,
         lock,
+        project,
+        triggerId,
         configs
       );
       // We were hitting GitHub's abuse detection algorithm,
       // add a short sleep between creating PRs to help circumvent:
       await new Promise(resolve => {
-        setTimeout(resolve, 500);
+        setTimeout(resolve, 500, null);
       });
     }
   }
 }
 
+// const UPDATE_LOCK_BUILD_TRIGGER_ID = 'd63288e8-3fb9-4469-b11a-9302fbe7783e';
+
 /**
- * Creates a pull request to update .OwlBot.lock.yaml, if one doesn't already
+ * Creates a cloud build to update .OwlBot.lock.yaml, if one doesn't already
  * exist.
  * @param db: database
- * @param octokit: Octokit.
  * @param repoFull: full repo name like "googleapis/nodejs-vision"
  * @param lock: The new contents of the lock file.
- * @returns: the uri of the new or existing pull request
+ * @param project: a google cloud project id
+ * @returns: the build id.
  */
-export async function createOnePullRequestForUpdatingLock(
+export async function triggerOneBuildForUpdatingLock(
   configsStore: ConfigsStore,
-  octokit: OctokitType,
   repoFull: string,
   lock: OwlBotLock,
-  configs?: Configs
+  project: string,
+  triggerId: string,
+  configs?: Configs,
+  owlBotCli = 'gcr.io/repo-automation-bots/owlbot-cli'
 ): Promise<string> {
-  const existingPullRequest = await configsStore.findPullRequestForUpdatingLock(
+  const existingBuildId = await configsStore.findBuildIdForUpdatingLock(
     repoFull,
     lock
   );
-  if (existingPullRequest) {
-    logger.info(`existing pull request ${existingPullRequest} found`);
-    return existingPullRequest;
+  if (existingBuildId) {
+    logger.info(`existing build id ${existingBuildId} found.`);
+    return existingBuildId;
   }
-  const [owner, repo] = repoFull.split('/');
-  // createPullRequest expects file updates as a Map
-  // of objects with content/mode:
-  const changes = new Map();
-  changes.set(owlBotLockPath, {
-    content: dump(lock),
-    mode: '100644',
-  });
-  // Opens a pull request with any files represented in changes:
-  logger.info(`opening pull request for ${lock.docker.digest}`);
-  const prNumber = await createPullRequest(
-    octokit as Octokit,
-    changes,
-    {
-      upstreamOwner: owner,
-      upstreamRepo: repo,
-      // TODO(rennie): we should provide a context aware commit
-      // message for this:
-      title: 'build: update .OwlBot.lock with new version of post-processor',
-      branch: `owlbot-lock-${Date.now()}`,
-      description: `Version ${
-        lock.docker.digest
-      } was published at ${new Date().toISOString()}.`,
-      primary: configs?.branchName ?? 'main',
-      force: true,
-      fork: false,
-      // TODO(bcoe): replace this message with last commit to synthtool:
-      message: 'build: update .OwlBot.lock with new version of post-processor',
+  const repo = githubRepoFromOwnerSlashName(repoFull);
+  const cb = core.getCloudBuildInstance();
+  const [, digest] = lock.docker.digest.split(':'); // Strip sha256: prefix
+  logger.info(`triggering build for ${repoFull}.`);
+  const [resp] = await cb.runBuildTrigger({
+    projectId: project,
+    triggerId: triggerId,
+    source: {
+      projectId: project,
+      substitutions: {
+        _PR_OWNER: repo.owner,
+        _REPOSITORY: repo.repo,
+        _PR_BRANCH: `owl-bot-update-lock-${digest}`,
+        _LOCK_FILE_PATH: OWL_BOT_LOCK_PATH,
+        _CONTAINER: `${lock.docker.image}@${lock.docker.digest}`,
+        _OWL_BOT_CLI: owlBotCli,
+      },
     },
-    {level: 'error'}
-  );
-  const newPullRequest = `https://github.com/${repoFull}/pull/${prNumber}`;
-  await configsStore.recordPullRequestForUpdatingLock(
-    repoFull,
-    lock,
-    newPullRequest
-  );
-  return newPullRequest;
+  });
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const buildId: string = (resp as any).metadata.build.id;
+  logger.info(`created build id ${buildId}.`);
+  await configsStore.recordBuildIdForUpdatingLock(repoFull, lock, buildId);
+  return buildId;
+}
+
+/**
+ * Iterates through all the paginated responses to collect the full list.
+ */
+async function listReposInOrg(
+  octokit: OctokitType,
+  githubOrg: string
+): Promise<ListReposResponse['data']> {
+  const result: ListReposResponse['data'] = [];
+  for await (const response of octokit.paginate.iterator(
+    octokit.repos.listForOrg,
+    {
+      org: githubOrg,
+    }
+  )) {
+    const repos = response.data as ListReposResponse['data'];
+    result.push(...repos);
+  }
+  return result;
 }
 
 /**
@@ -169,43 +185,53 @@ export async function createOnePullRequestForUpdatingLock(
  */
 export async function scanGithubForConfigs(
   configsStore: ConfigsStore,
-  octokit: OctokitType,
+  octokitFactory: OctokitFactory,
   githubOrg: string,
-  orgInstallationId: number
+  orgInstallationId: number,
+  ignoreRepos: string[]
 ): Promise<void> {
-  let count = 0; // Count of repos scanned for debugging purposes.
-  for await (const response of octokit.paginate.iterator(
-    octokit.repos.listForOrg,
-    {
-      org: githubOrg,
+  logger.info(`scan ${githubOrg} installation = ${orgInstallationId}`);
+  logger.metric('owlbot.scan_github_for_configs', {
+    org: githubOrg,
+    installationId: orgInstallationId,
+  });
+  const repos = await listReposInOrg(
+    await octokitFactory.getShortLivedOctokit(),
+    githubOrg
+  );
+  for (const repo of repos) {
+    // Load the current configs from the db.
+    const repoFull = `${githubOrg}/${repo.name}`;
+    if (ignoreRepos.includes(repo.name)) {
+      console.info(`Ignoring ${repoFull}`);
+      continue;
     }
-  )) {
-    const repos = response.data as ListReposResponse['data'];
-    logger.info(`count = ${count} page size = ${repos.length}`);
-    for (const repo of repos) {
-      count++;
-      // Load the current configs from the db.
-      const repoFull = `${githubOrg}/${repo.name}`;
-      const configs = await configsStore.getConfigs(repoFull);
-      const defaultBranch = repo.default_branch ?? 'master';
-      logger.info(`refresh config for ${githubOrg}/${repo.name}`);
-      try {
-        await refreshConfigs(
-          configsStore,
-          configs,
-          octokit,
-          githubOrg,
-          repo.name,
-          defaultBranch,
-          orgInstallationId
-        );
-      } catch (err) {
-        if (err.status === 404) {
-          logger.warn(`received 404 refreshing ${githubOrg}/${repo.name}`);
-          continue;
-        } else {
-          throw err;
-        }
+    if (repo.archived) {
+      configsStore.clearConfigs(repoFull);
+      console.info(
+        `Removing ${repoFull}'s configs from the database because the repo is archived.`
+      );
+      continue;
+    }
+    const configs = await configsStore.getConfigs(repoFull);
+    const defaultBranch = repo.default_branch ?? 'master';
+    logger.info(`Refreshing configs for ${githubOrg}/${repo.name}`);
+    try {
+      await refreshConfigs(
+        configsStore,
+        configs,
+        await octokitFactory.getShortLivedOctokit(),
+        githubRepo(githubOrg, repo.name),
+        defaultBranch,
+        orgInstallationId
+      );
+    } catch (e) {
+      const err = e as RequestError;
+      if (err.status === 404) {
+        logger.warn(`received 404 refreshing ${githubOrg}/${repo.name}`);
+        continue;
+      } else {
+        throw err;
       }
     }
   }
@@ -228,18 +254,17 @@ export async function refreshConfigs(
   configsStore: ConfigsStore,
   configs: Configs | undefined,
   octokit: OctokitType,
-  githubOrg: string,
-  repoName: string,
+  githubRepo: GithubRepo,
   defaultBranch: string,
   installationId: number
 ): Promise<void> {
   // Query github for the commit hash of the default branch.
   const {data: branchData} = await octokit.repos.getBranch({
-    owner: githubOrg,
-    repo: repoName,
+    owner: githubRepo.owner,
+    repo: githubRepo.repo,
     branch: defaultBranch,
   });
-  const repoFull = `${githubOrg}/${repoName}`;
+  const repoFull = githubRepo.toString();
   const commitHash = branchData.commit.sha;
   if (!commitHash) {
     logger.error(`${repoFull}:${defaultBranch} is missing a commit sha!`);
@@ -249,7 +274,7 @@ export async function refreshConfigs(
     configs?.commitHash === commitHash &&
     configs?.branchName === defaultBranch
   ) {
-    logger.info(`Configs for ${repoFull} or up to date.`);
+    logger.info(`Configs for ${repoFull} are up to date.`);
     return; // configsStore is up to date.
   }
 
@@ -260,42 +285,14 @@ export async function refreshConfigs(
     commitHash: commitHash,
   };
 
-  // Query github for the contents of the lock file.
-  const lockContent = await core.getFileContent(
-    githubOrg,
-    repoName,
-    owlBotLockPath,
-    commitHash,
-    octokit
-  );
-  if (lockContent) {
-    try {
-      newConfigs.lock = owlBotLockFrom(
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        yaml.load(lockContent) as Record<string, any>
-      );
-    } catch (e) {
-      logger.error(
-        `${repoFull} has an invalid ${owlBotLockPath} file: ${e.message}`
-      );
-    }
+  const {lock, yamls, badConfigs} = await fetchConfigs(githubRepo, commitHash);
+  if (lock) {
+    newConfigs.lock = lock;
+  }
+  if (yamls.length > 0) {
+    newConfigs.yamls = yamls;
   }
 
-  // Query github for the contents of the yaml file.
-  const yamlContent = await core.getFileContent(
-    githubOrg,
-    repoName,
-    owlBotYamlPath,
-    commitHash,
-    octokit
-  );
-  if (yamlContent) {
-    try {
-      newConfigs.yaml = owlBotYamlFromText(yamlContent);
-    } catch (e) {
-      logger.error(`${repoFull} has an invalid ${owlBotYamlPath} file: ${e}`);
-    }
-  }
   // Store the new configs back into the database.
   const stored = await configsStore.storeConfigs(
     repoFull,
@@ -304,6 +301,18 @@ export async function refreshConfigs(
   );
   if (stored) {
     logger.info(`Stored new configs for ${repoFull}`);
+    for (const badConfig of badConfigs) {
+      await createIssueIfTitleDoesntExist(
+        octokit,
+        githubRepo.owner,
+        githubRepo.repo,
+        badConfig.path + ' is broken.',
+        [
+          'This repo will not receive automatic updates until this issue is fixed.\n',
+          ...badConfig.errorMessages,
+        ].join('\n* ')
+      );
+    }
   } else {
     logger.info(
       `Mid-air collision! ${repoFull}'s configs were already updated.`

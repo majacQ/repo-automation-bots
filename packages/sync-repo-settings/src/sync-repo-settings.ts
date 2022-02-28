@@ -19,7 +19,10 @@ import {
   BranchProtectionRule,
   PermissionRule,
 } from './types';
+// eslint-disable-next-line node/no-extraneous-import
 import {Octokit} from '@octokit/rest';
+// eslint-disable-next-line node/no-extraneous-import
+import {RequestError} from '@octokit/types';
 import checks from './required-checks.json';
 
 export interface Logger {
@@ -52,7 +55,6 @@ const repoConfigDefaults: RepoConfig = deepFreeze({
 });
 
 const branchProtectionDefaults = deepFreeze({
-  pattern: 'master',
   dismissesStaleReviews: false,
   isAdminEnforced: true,
   requiredApprovingReviewCount: 1,
@@ -62,12 +64,14 @@ const branchProtectionDefaults = deepFreeze({
   requiresStrictStatusChecks: false,
   restrictsPushes: false,
   restrictsReviewDismissals: false,
+  requiresLinearHistory: true,
   requiredStatusCheckContexts: [],
 });
 
 export interface SyncRepoSettingsOptions {
   config?: RepoConfig;
   repo: string;
+  defaultBranch?: string;
 }
 
 export class SyncRepoSettings {
@@ -78,7 +82,6 @@ export class SyncRepoSettings {
     const logger = this.logger;
     const repo = options.repo;
     const [owner, name] = repo.split('/');
-    let ignored = false;
     if (!config) {
       logger.info(`no local config found for ${repo}, checking global config`);
       // Fetch the list of languages used in this repository
@@ -115,51 +118,42 @@ export class SyncRepoSettings {
       if (!config) {
         logger.info(`no config for language ${language}`);
       }
-
-      // Check for repositories we're specifically configured to skip
-      ignored = !!languageConfig[language]?.ignoredRepos?.find(x => x === repo);
-      if (ignored) {
-        logger.info(`ignoring repo ${repo}`);
-      }
-
-      if (languageConfig[language]?.repoOverrides) {
-        const customConfig = languageConfig[language].repoOverrides!.find(
-          x => x.repo === repo
-        );
-        if (customConfig) {
-          logger.info(`Discovered override config for ${repo}`);
-          config.branchProtectionRules = customConfig.branchProtectionRules;
-        }
-      }
     }
 
+    const defaultBranch =
+      options.defaultBranch || (await this.getDefaultBranch(repo));
+    const defaultBranchRuleConfig = {
+      pattern: defaultBranch,
+    };
+
     const jobs: Promise<void>[] = [];
+    logger.info('updating settings');
     jobs.push(this.updateRepoTeams(repo, config?.permissionRules || []));
-    if (!ignored && config) {
+    if (config) {
       jobs.push(this.updateRepoOptions(repo, config));
       if (config.branchProtectionRules) {
-        jobs.push(
-          this.updateMasterBranchProtection(repo, config.branchProtectionRules)
-        );
+        config.branchProtectionRules.forEach(rule => {
+          const ruleWithDefaultBranch = {
+            ...defaultBranchRuleConfig,
+            ...rule,
+          };
+          jobs.push(this.updateBranchProtection(repo, ruleWithDefaultBranch));
+        });
       }
     }
     await Promise.all(jobs);
   }
 
   /**
-   * Enable master branch protection, and required status checks
-   * @param repos List of repos to iterate.
+   * Enable branch protection, and required status checks
+   * @param repo Owner/Repo to update
+   * @param rule The branch protection rules
    */
-  async updateMasterBranchProtection(
-    repo: string,
-    rules: BranchProtectionRule[]
-  ) {
+  async updateBranchProtection(repo: string, rule: BranchProtectionRule) {
     const logger = this.logger;
-    logger.info(`Updating master branch protection for ${repo}`);
+    logger.info(`Updating ${rule.pattern} branch protection for ${repo}`);
     const [owner, name] = repo.split('/');
 
-    // TODO: add support for mutiple rules
-    let rule = rules[0];
     logger.debug('Rules before applying defaults:');
     logger.debug(rule);
 
@@ -186,19 +180,23 @@ export class SyncRepoSettings {
           strict: rule.requiresStrictStatusChecks!,
         },
         enforce_admins: rule.isAdminEnforced!,
+        required_linear_history: rule.requiresLinearHistory,
         restrictions: null!,
         headers: {
           accept: 'application/vnd.github.luke-cage-preview+json',
         },
       });
-      logger.info(`Success updating master branch protection for ${repo}`);
-    } catch (err) {
+      logger.info(
+        `Success updating branch protection for ${repo}:${rule.pattern}`
+      );
+    } catch (e) {
+      const err = e as RequestError & Error;
       if (err.status === 401) {
         logger.warn(
-          `updateMasterBranchProtection: warning received ${err.status} updating ${owner}/${name}`
+          `updateBranchProtection: warning received ${err.status} updating ${owner}/${name}`
         );
       } else {
-        err.message = `updateMasterBranchProtection: error received ${err.status} updating ${owner}/${name}\n\n${err.message}`;
+        err.message = `updateBranchProtection: error received ${err.status} updating ${owner}/${name}\n\n${err.message}`;
         logger.error(err);
         return;
       }
@@ -239,7 +237,8 @@ export class SyncRepoSettings {
         })
       );
       logger.info(`Success updating repo in org for ${repo}`);
-    } catch (err) {
+    } catch (e) {
+      const err = e as RequestError & Error;
       const knownErrors = [
         401, // bot does not have permission to access this repository.
         404, // team being added does not exist on repo.
@@ -281,7 +280,8 @@ export class SyncRepoSettings {
         delete_branch_on_merge: config.deleteBranchOnMerge,
       });
       logger.info(`Success updating repo options for ${repo}`);
-    } catch (err) {
+    } catch (e) {
+      const err = e as RequestError & Error;
       const knownErrors = [
         401, // bot does not have permission to access this repository.
         403, // thrown if repo is archived.
@@ -296,5 +296,14 @@ export class SyncRepoSettings {
         return;
       }
     }
+  }
+
+  async getDefaultBranch(ownerAndRepo: string): Promise<string> {
+    const [owner, repo] = ownerAndRepo.split('/');
+    const response = await this.octokit.repos.get({
+      owner,
+      repo,
+    });
+    return response.data.default_branch;
   }
 }

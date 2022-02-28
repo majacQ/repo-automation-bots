@@ -14,28 +14,13 @@
 
 // eslint-disable-next-line node/no-extraneous-import
 import {Probot, Context} from 'probot';
-import {RepoConfig} from './types';
 import {logger} from 'gcf-utils';
-import Ajv from 'ajv';
-import yaml from 'js-yaml';
-import {operations} from '@octokit/openapi-types';
+import {ConfigChecker, getConfig} from '@google-automations/bot-config-utils';
+
 import {SyncRepoSettings} from './sync-repo-settings';
-
-type PullsListFilesResponseData = operations['pulls/list-files']['responses']['200']['content']['application/json'];
-export const configFileName = 'sync-repo-settings.yaml';
-
-type Conclusion =
-  | 'success'
-  | 'failure'
-  | 'neutral'
-  | 'cancelled'
-  | 'timed_out'
-  | 'action_required'
-  | undefined;
-
-// configure the schema validator once
+import {RepoConfig} from './types';
 import schema from './schema.json';
-const ajv = new Ajv();
+import {CONFIG_FILE_NAME} from './config';
 
 /**
  * Main.  On a nightly cron, update the settings for a given repository.
@@ -48,77 +33,19 @@ export function handler(app: Probot) {
       'pull_request.reopened',
       'pull_request.synchronize',
     ],
-    async (context: Context) => {
-      const owner = context.payload.repository.owner.login;
-      const repo = context.payload.repository.name;
-      const number = context.payload.number;
-      let files: PullsListFilesResponseData;
-      try {
-        files = await context.octokit.paginate(
-          context.octokit.pulls.listFiles.endpoint.merge({
-            owner,
-            repo,
-            pull_number: number,
-            per_page: 100,
-          })
-        );
-      } catch (e) {
-        e.message = `Error fetching files for PR ${owner}/${repo}#${number}\n\n${e.message}`;
-        logger.error(e);
-        return;
-      }
-      for (const file of files) {
-        if (
-          file.status === 'deleted' ||
-          (file.filename !== `.github/${configFileName}` &&
-            (repo !== '.github' || file.filename !== configFileName))
-        ) {
-          continue;
-        }
-        const blob = await context.octokit.git.getBlob({
-          owner,
-          repo,
-          file_sha: file.sha,
-        });
-        const configYaml = Buffer.from(blob.data.content, 'base64').toString(
-          'utf8'
-        );
-        const config = yaml.load(configYaml);
-        let isValid = false;
-        let errorText = '';
-        if (typeof config === 'object') {
-          const validateSchema = ajv.compile(schema);
-          isValid = await validateSchema(config);
-          errorText = JSON.stringify(validateSchema.errors, null, 4);
-        } else {
-          errorText = `${configFileName} is not valid YAML 😱`;
-        }
-
-        const checkParams = context.repo({
-          name: 'sync-repo-settings-check',
-          head_sha: context.payload.pull_request.head.sha,
-          conclusion: 'success' as Conclusion,
-          output: {
-            title: `Successful ${configFileName} check`,
-            summary: `${configFileName} matches the required schema`,
-            text: 'Success',
-          },
-        });
-        if (!isValid) {
-          (checkParams.conclusion = 'failure'),
-            (checkParams.output = {
-              title: `Invalid ${configFileName} schema 😱`,
-              summary: `${configFileName} does not match the required schema 😱`,
-              text: errorText,
-            });
-        }
-        try {
-          await context.octokit.checks.create(checkParams);
-        } catch (e) {
-          e.message = `Error creating validation status check: ${e.message}`;
-          logger.error(e);
-        }
-      }
+    async (context: Context<'pull_request'>) => {
+      const configChecker = new ConfigChecker<RepoConfig>(
+        schema,
+        CONFIG_FILE_NAME
+      );
+      const {owner, repo} = context.repo();
+      await configChecker.validateConfigChanges(
+        context.octokit,
+        owner,
+        repo,
+        context.payload.pull_request.head.sha,
+        context.payload.pull_request.number
+      );
     }
   );
 
@@ -130,20 +57,21 @@ export function handler(app: Probot) {
   app.on('push', async context => {
     const branch = context.payload.ref;
     const defaultBranch = context.payload.repository.default_branch;
-    if (branch !== `refs/head/${defaultBranch}`) {
+    if (branch !== `refs/heads/${defaultBranch}`) {
+      logger.info(`skipping non-default branch: ${branch}`);
       return;
     }
     // Look at all commits, and all files changed during those commits.
     // If they contain a `sync-repo-settings.yaml`, re-sync the repo.
     function includesConfig() {
-      const fileChangedLists = ['added', 'modified', 'removed'];
       for (const commit of context.payload.commits) {
-        for (const list of fileChangedLists) {
-          if (commit[list]) {
-            for (const file of commit[list]) {
-              if (file?.includes(configFileName)) {
-                return true;
-              }
+        for (const files of [commit.added, commit.modified, commit.removed]) {
+          if (files === undefined) {
+            continue;
+          }
+          for (const file of files) {
+            if (file?.includes(CONFIG_FILE_NAME)) {
+              return true;
             }
           }
         }
@@ -151,51 +79,65 @@ export function handler(app: Probot) {
       return false;
     }
     if (!includesConfig()) {
+      logger.info('skipping push that does not modify config');
+      logger.debug(context.payload.commits);
       return;
     }
 
-    const owner = context.payload.organization?.login;
-    const name = context.payload.repository.name;
-    const config = await getConfig(context);
+    const {owner, repo} = context.repo();
+    const config = await getConfig<RepoConfig>(
+      context.octokit,
+      owner,
+      repo,
+      CONFIG_FILE_NAME,
+      {fallbackToOrgConfig: false, schema: schema}
+    );
     const repoSettings = new SyncRepoSettings(context.octokit, logger);
     await repoSettings.syncRepoSettings({
-      repo: `${owner}/${name}`,
-      config: config!,
+      repo: `${owner}/${repo}`,
+      config: config || undefined,
+      defaultBranch: repo.default_branch,
     });
   });
 
-  // meta comment about the '*' here: https://github.com/octokit/webhooks.js/issues/277
-  app.on(['schedule.repository' as '*'], async (context: Context) => {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  app.on(['schedule.repository' as any], async context => {
     logger.info(`running for org ${context.payload.cron_org}`);
-    const owner = context.payload.organization.login;
-    const name = context.payload.repository.name;
-
+    const {owner, repo} = context.repo();
     if (context.payload.cron_org !== owner) {
       logger.info(`skipping run for ${context.payload.cron_org}`);
       return;
     }
 
-    const config = await getConfig(context);
+    const config = await getConfig<RepoConfig>(
+      context.octokit,
+      owner,
+      repo,
+      CONFIG_FILE_NAME,
+      {fallbackToOrgConfig: false, schema: schema}
+    );
+
     const repoSettings = new SyncRepoSettings(context.octokit, logger);
     await repoSettings.syncRepoSettings({
-      repo: `${owner}/${name}`,
-      config: config!,
+      repo: `${owner}/${repo}`,
+      config: config || undefined,
     });
   });
-}
 
-/**
- * Allow repositories to optionally provide their own, localized config.
- * Check the `.github/sync-repo-settings.yaml` file, and if available,
- * use that config over any config broadly provided here.
- */
-async function getConfig(context: Context) {
-  let config!: RepoConfig | null;
-  try {
-    config = await context.config<RepoConfig>(configFileName);
-  } catch (err) {
-    err.message = `Error reading configuration: ${err.message}`;
-    logger.error(err);
-  }
-  return config;
+  app.on('repository.transferred', async context => {
+    const {owner, repo} = context.repo();
+    const config = await getConfig<RepoConfig>(
+      context.octokit,
+      owner,
+      repo,
+      CONFIG_FILE_NAME,
+      {fallbackToOrgConfig: false, schema: schema}
+    );
+    const repoSettings = new SyncRepoSettings(context.octokit, logger);
+    await repoSettings.syncRepoSettings({
+      repo: `${owner}/${repo}`,
+      config: config || undefined,
+      defaultBranch: repo.default_branch,
+    });
+  });
 }

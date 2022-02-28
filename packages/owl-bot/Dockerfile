@@ -12,9 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Use the official lightweight Node.js 12 image.
+# The Dockerfile for owlbot-cli
+
+# Use the official lightweight Node.js 14 image.
 # https://hub.docker.com/_/node
 FROM node:14-alpine
+
+# Bump the heap size
+ENV NODE_OPTIONS='--max-old-space-size=8192'
 
 # Create and change to the app directory.
 WORKDIR /usr/src/app
@@ -31,7 +36,9 @@ RUN apk update && apk upgrade && \
 # RUN npm ci --only=production
 RUN npm install
 RUN npm run compile
-RUN chmod 755 /usr/src/app/build/src/bin/owl-bot.js
+
+# Make sure users besides root can run the app.
+RUN chmod a+rx -R .
 
 # Run the web service on container startup.
 ENTRYPOINT ["/usr/src/app/build/src/bin/owl-bot.js"]

@@ -14,13 +14,21 @@
 
 // eslint-disable-next-line node/no-extraneous-import
 import {Probot} from 'probot';
+// eslint-disable-next-line node/no-extraneous-import
+import {Octokit} from '@octokit/rest';
 import {logger} from 'gcf-utils';
+import {ConfigChecker, getConfig} from '@google-automations/bot-config-utils';
+import {
+  Annotation,
+  ConfigurationOptions,
+  WELL_KNOWN_CONFIGURATION_FILE,
+} from './config';
+import schema from './config-schema.json';
+import {
+  getAuthenticatedOctokit,
+  SECRET_NAME_FOR_COMMENT_PERMISSION,
+} from './utils';
 
-interface ConfigurationOptions {
-  trustedContributors?: string[];
-}
-
-const WELL_KNOWN_CONFIGURATION_FILE = 'trusted-contribution.yml';
 const DEFAULT_TRUSTED_CONTRIBUTORS = [
   'renovate-bot',
   'dependabot[bot]',
@@ -28,7 +36,11 @@ const DEFAULT_TRUSTED_CONTRIBUTORS = [
   'gcf-merge-on-green[bot]',
   'yoshi-code-bot',
   'gcf-owl-bot[bot]',
+  'google-cloud-policy-bot[bot]',
 ];
+const DEFAULT_LABELS = ['kokoro:force-run'];
+const OWLBOT_LABEL = 'owlbot:run';
+const OWLBOT_CONFIG_PATH = '.github/.OwlBot.lock.yaml';
 
 function isTrustedContribution(
   config: ConfigurationOptions,
@@ -53,24 +65,101 @@ export = (app: Probot) => {
       'pull_request.synchronize',
     ],
     async context => {
+      const {owner, repo} = context.repo();
+      const configChecker = new ConfigChecker<ConfigurationOptions>(
+        schema,
+        WELL_KNOWN_CONFIGURATION_FILE
+      );
+      await configChecker.validateConfigChanges(
+        context.octokit,
+        owner,
+        repo,
+        context.payload.pull_request.head.sha,
+        context.payload.pull_request.number
+      );
+
       const PR_AUTHOR = context.payload.pull_request.user.login;
       let remoteConfiguration: ConfigurationOptions | null;
+      // Since we added a capability of opting out, we quit upon
+      // errors when fetching the config.
       try {
-        remoteConfiguration = await context.config<ConfigurationOptions>(
-          WELL_KNOWN_CONFIGURATION_FILE
+        remoteConfiguration = await getConfig<ConfigurationOptions>(
+          context.octokit,
+          owner,
+          repo,
+          WELL_KNOWN_CONFIGURATION_FILE,
+          {schema: schema}
         );
-      } catch (err) {
+      } catch (e) {
+        const err = e as Error;
         err.message = `Error reading configuration: ${err.message}`;
         logger.error(err);
+        return;
       }
-      remoteConfiguration = remoteConfiguration! || {};
-      // TODO: add additional verification that only dependency version changes occurred.
+      remoteConfiguration = remoteConfiguration || {};
+
+      // quit if disabled.
+      if (remoteConfiguration.disabled) {
+        return;
+      }
+
       if (isTrustedContribution(remoteConfiguration, PR_AUTHOR)) {
-        const issuesAddLabelsParams = context.repo({
-          issue_number: context.payload.pull_request.number,
-          labels: ['kokoro:force-run'],
-        });
-        await context.octokit.issues.addLabels(issuesAddLabelsParams);
+        // Only adds owlbot:run if repository appears to be configured for OwlBot:
+        let hasOwlBotConfig = false;
+        try {
+          await context.octokit.rest.repos.getContent({
+            owner,
+            repo,
+            path: OWLBOT_CONFIG_PATH,
+          });
+          hasOwlBotConfig = true;
+        } catch (_err) {
+          const err = _err as {code: number};
+          if (err.code !== 404) {
+            throw err;
+          }
+        }
+        const defaultAnnotations: Array<Annotation> = [
+          {type: 'label', text: [...DEFAULT_LABELS]},
+        ];
+        if (
+          hasOwlBotConfig &&
+          !defaultAnnotations[0].text.includes(OWLBOT_LABEL)
+        ) {
+          (defaultAnnotations[0].text as Array<string>).push(OWLBOT_LABEL);
+        }
+
+        const annotations =
+          remoteConfiguration.annotations || defaultAnnotations;
+        let octokit: Octokit | null = null;
+        for (const annotation of annotations) {
+          if (annotation.type === 'label') {
+            const issuesAddLabelsParams = context.repo({
+              issue_number: context.payload.pull_request.number,
+              labels: Array.isArray(annotation.text)
+                ? annotation.text
+                : [annotation.text],
+            });
+            await context.octokit.issues.addLabels(issuesAddLabelsParams);
+            logger.metric('trusted_contribution.labeled', {
+              url: context.payload.pull_request.url,
+            });
+          } else if (annotation.type === 'comment') {
+            // Use personal access token from the secret manager.
+            if (octokit === null) {
+              octokit = await getAuthenticatedOctokit(
+                process.env.PROJECT_ID || '',
+                SECRET_NAME_FOR_COMMENT_PERMISSION
+              );
+            }
+            await octokit.issues.createComment({
+              issue_number: context.payload.pull_request.number,
+              body: String(annotation.text),
+              owner: context.repo().owner,
+              repo: context.repo().repo,
+            });
+          }
+        }
       }
     }
   );

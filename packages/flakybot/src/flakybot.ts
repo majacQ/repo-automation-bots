@@ -25,30 +25,65 @@
 // eslint-disable-next-line node/no-extraneous-import
 import {Probot, Logger} from 'probot';
 import xmljs from 'xml-js';
+import {DatastoreLock} from '@google-automations/datastore-lock';
 // eslint-disable-next-line node/no-extraneous-import
 import {Octokit} from '@octokit/rest';
 import {components} from '@octokit/openapi-types';
+import {logger} from 'gcf-utils';
+import {
+  getConfigWithDefault,
+  ConfigChecker,
+} from '@google-automations/bot-config-utils';
+import {syncLabels} from '@google-automations/label-utils';
+import schema from './config-schema.json';
+import {ISSUE_LABEL, FLAKY_LABEL, QUIET_LABEL, FLAKYBOT_LABELS} from './labels';
 
-type IssuesListForRepoResponseItem = components['schemas']['issue-simple'];
+export interface Config {
+  issuePriority: string;
+}
+export const DEFAULT_CONFIG: Config = {issuePriority: 'p1'};
+export const CONFIG_FILENAME = 'flakybot.yaml';
+
+type IssuesListForRepoResponseItem = components['schemas']['issue'];
 type IssuesListCommentsResponseData = components['schemas']['issue-comment'][];
 type IssuesListForRepoResponseData = IssuesListForRepoResponseItem[];
 
-const ISSUE_LABEL = 'flakybot: issue';
-const FLAKY_LABEL = 'flakybot: flaky';
-const QUIET_LABEL = 'flakybot: quiet';
-const BUG_LABELS = 'type: bug,priority: p1';
+interface Label {
+  id?: number;
+  node_id?: string;
+  url?: string;
+  name?: string;
+  description?: string | null;
+  color?: string | null;
+  default?: boolean;
+}
 
-const LABELS_FOR_FLAKY_ISSUE = BUG_LABELS.split(',').concat([
-  ISSUE_LABEL,
-  FLAKY_LABEL,
-]);
-const LABELS_FOR_NEW_ISSUE = BUG_LABELS.split(',').concat([ISSUE_LABEL]);
+function isArray(label: Label[] | unknown | string): label is Label[] {
+  return Array.isArray(label);
+}
+
+function isString(label: Label[] | unknown | string): label is string {
+  return typeof label === 'string';
+}
+
+function getLabelsForFlakyIssue(config: Config): string[] {
+  return [
+    'type: bug',
+    `priority: ${config.issuePriority}`,
+    ISSUE_LABEL,
+    FLAKY_LABEL,
+  ];
+}
+
+function getLabelsForNewIssue(config: Config): string[] {
+  return ['type: bug', `priority: ${config.issuePriority}`, ISSUE_LABEL];
+}
 
 const EVERYTHING_FAILED_TITLE = 'The build failed';
 
 const NEW_ISSUE_MESSAGE = `This test failed!
 
-To configure my behavior, see [the Flaky Bot documentation](https://github.com/googleapis/repo-automation-bots/tree/master/packages/flakybot).
+To configure my behavior, see [the Flaky Bot documentation](https://github.com/googleapis/repo-automation-bots/tree/main/packages/flakybot).
 
 If I'm commenting on this issue too often, add the \`flakybot: quiet\` label and
 I will stop commenting.
@@ -111,63 +146,108 @@ interface PubSubContext {
 }
 
 export function flakybot(app: Probot) {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  app.on('schedule.repository' as any, async context => {
+    const owner = context.payload.organization.login;
+    const repo = context.payload.repository.name;
+    await syncLabels(context.octokit, owner, repo, FLAKYBOT_LABELS);
+  });
+  app.on(
+    [
+      'pull_request.opened',
+      'pull_request.reopened',
+      'pull_request.edited',
+      'pull_request.synchronize',
+    ],
+    async context => {
+      const configChecker = new ConfigChecker<Config>(schema, CONFIG_FILENAME);
+      const {owner, repo} = context.repo();
+      await configChecker.validateConfigChanges(
+        context.octokit,
+        owner,
+        repo,
+        context.payload.pull_request.head.sha,
+        context.payload.pull_request.number
+      );
+    }
+  );
+
   // meta comment about the 'any' here: https://github.com/octokit/webhooks.js/issues/277
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  app.on('pubsub.message' as any, async (context: PubSubContext) => {
-    const owner = context.payload.organization?.login;
-    const repo = context.payload.repository?.name;
-    const commit = context.payload.commit || '[TODO: set commit]';
-    const buildURL = context.payload.buildURL || '[TODO: set buildURL]';
+  app.on('pubsub.message' as any, async context => {
+    const typedContext = context as unknown as PubSubContext;
+    const owner = typedContext.payload.organization?.login;
+    const repo = typedContext.payload.repository?.name;
+    const commit = typedContext.payload.commit || '[TODO: set commit]';
+    const buildURL = typedContext.payload.buildURL || '[TODO: set buildURL]';
 
-    context.log.info(`[${owner}/${repo}] processing ${buildURL}`);
+    const config = await getConfigWithDefault<Config>(
+      typedContext.octokit,
+      owner,
+      repo,
+      CONFIG_FILENAME,
+      DEFAULT_CONFIG,
+      {schema: schema}
+    );
+    logger.debug(`config: ${config}`);
+    typedContext.log.info(`[${owner}/${repo}] processing ${buildURL}`);
 
     let results: TestResults;
-    if (context.payload.xunitXML) {
-      const xml = Buffer.from(context.payload.xunitXML, 'base64').toString();
+    if (typedContext.payload.xunitXML) {
+      const xml = Buffer.from(
+        typedContext.payload.xunitXML,
+        'base64'
+      ).toString();
       results = flakybot.findTestResults(xml);
     } else {
-      if (context.payload.testsFailed === undefined) {
-        context.log.info(
+      if (typedContext.payload.testsFailed === undefined) {
+        typedContext.log.info(
           `[${owner}/${repo}] No xunitXML and no testsFailed! Skipping.`
         );
         return;
       }
-      if (context.payload.testsFailed) {
+      if (typedContext.payload.testsFailed) {
         results = {passes: [], failures: [{passed: false}]}; // A single failure is used to indicate the whole build failed.
       } else {
         results = {passes: [], failures: []}; // Tests passed.
       }
     }
 
-    context.log.info(
+    typedContext.log.info(
       `[${owner}/${repo}] Found ${results.passes.length} passed tests and ${results.failures.length} failed tests in this result of ${buildURL}`
     );
     if (results.passes.length > 0) {
-      context.log.info(
+      typedContext.log.info(
         `[${owner}/${repo}] example pass: ${results.passes[0].package}: ${results.passes[0].testCase}`
       );
     }
     if (results.failures.length > 0) {
-      context.log.info(
+      typedContext.log.info(
         `[${owner}/${repo}] example failure: ${results.failures[0].package}: ${results.failures[0].testCase}`
       );
     }
 
     // Get the list of issues once, before opening/closing any of them.
-    const options = context.octokit.issues.listForRepo.endpoint.merge({
+    const options = typedContext.octokit.issues.listForRepo.endpoint.merge({
       owner,
       repo,
       per_page: 100,
       labels: ISSUE_LABEL,
       state: 'all', // Include open and closed issues.
     });
-    let issues = (await context.octokit.paginate(
+    let issues = (await typedContext.octokit.paginate(
       options
     )) as IssuesListForRepoResponseData;
 
     // If we deduplicate any issues, re-download the issues.
     if (
-      await flakybot.deduplicateIssues(results, issues, context, owner, repo)
+      await flakybot.deduplicateIssues(
+        results,
+        issues,
+        typedContext,
+        owner,
+        repo
+      )
     ) {
       issues = await context.octokit.paginate(options);
     }
@@ -176,7 +256,8 @@ export function flakybot(app: Probot) {
     await flakybot.openIssues(
       results.failures,
       issues,
-      context,
+      typedContext,
+      config,
       owner,
       repo,
       commit,
@@ -186,7 +267,8 @@ export function flakybot(app: Probot) {
     await flakybot.closeIssues(
       results,
       issues,
-      context,
+      typedContext,
+      config,
       owner,
       repo,
       commit,
@@ -259,6 +341,7 @@ flakybot.openIssues = async (
   failures: TestCase[],
   issues: IssuesListForRepoResponseData,
   context: PubSubContext,
+  config: Config,
   owner: string,
   repo: string,
   commit: string,
@@ -276,45 +359,62 @@ flakybot.openIssues = async (
     // issue.
     const groupedIssue = flakybot.findGroupedIssue(issues, pkg);
     if (groupedIssue) {
-      // If a group issue exists, say stuff failed.
-      // Don't comment if it's asked to be quiet.
-      if (hasLabel(groupedIssue, QUIET_LABEL)) {
-        continue;
-      }
+      // Acquire the lock, then fetch the issue and update, release the lock.
+      const lock = new DatastoreLock('flakybot', groupedIssue.url);
+      // Ignore the failure because it's not fatal.
+      await lock.acquire();
+      try {
+        // We need to re fetch the issue.
+        const issue = await context.octokit.issues.get({
+          owner: owner,
+          repo: repo,
+          issue_number: groupedIssue.number,
+        });
+        // Then update the new issue.
+        const groupedIssueToModify =
+          issue.data as IssuesListForRepoResponseItem;
 
-      // Don't comment if it's flaky.
-      if (flakybot.isFlaky(groupedIssue)) {
-        continue;
-      }
+        // If a group issue exists, say stuff failed.
+        // Don't comment if it's asked to be quiet.
+        if (hasLabel(groupedIssueToModify, QUIET_LABEL)) {
+          continue;
+        }
 
-      // Don't comment if we've already commented with this build failure.
-      const [containsFailure] = await flakybot.containsBuildFailure(
-        groupedIssue,
-        context,
-        owner,
-        repo,
-        commit
-      );
-      if (containsFailure) {
-        continue;
-      }
+        // Don't comment if it's flaky.
+        if (flakybot.isFlaky(groupedIssueToModify)) {
+          continue;
+        }
+        // Don't comment if we've already commented with this build failure.
+        const [containsFailure] = await flakybot.containsBuildFailure(
+          groupedIssueToModify,
+          context,
+          owner,
+          repo,
+          commit
+        );
+        if (containsFailure) {
+          continue;
+        }
 
-      const testCase = flakybot.groupedTestCase(pkg);
-      const testString = pkgFailures.length === 1 ? 'test' : 'tests';
-      const body = `${
-        pkgFailures.length
-      } ${testString} failed in this package for commit ${commit} (${buildURL}).\n\n-----\n${flakybot.formatBody(
-        testCase,
-        commit,
-        buildURL
-      )}`;
-      await context.octokit.issues.createComment({
-        owner,
-        repo,
-        issue_number: groupedIssue.number,
-        body,
-      });
-      continue;
+        const testCase = flakybot.groupedTestCase(pkg);
+        const testString = pkgFailures.length === 1 ? 'test' : 'tests';
+        const body = `${
+          pkgFailures.length
+        } ${testString} failed in this package for commit ${commit} (${buildURL}).\n\n-----\n${flakybot.formatBody(
+          testCase,
+          commit,
+          buildURL
+        )}`;
+        await context.octokit.issues.createComment({
+          owner,
+          repo,
+          issue_number: groupedIssueToModify.number,
+          body,
+        });
+        continue;
+      } finally {
+        await lock.release();
+      }
     }
     // There is no grouped issue for this package.
     // Check if 10 or more tests failed.
@@ -350,7 +450,7 @@ flakybot.openIssues = async (
           repo,
           title: flakybot.formatGroupedTitle(pkg),
           body,
-          labels: LABELS_FOR_NEW_ISSUE,
+          labels: getLabelsForNewIssue(config),
         })
       ).data;
       context.log.info(`[${owner}/${repo}]: created issue #${newIssue.number}`);
@@ -363,6 +463,7 @@ flakybot.openIssues = async (
       if (!existingIssue) {
         await flakybot.openNewIssue(
           context,
+          config,
           owner,
           repo,
           commit,
@@ -374,82 +475,103 @@ flakybot.openIssues = async (
       context.log.info(
         `[${owner}/${repo}] existing issue #${existingIssue.number}: state: ${existingIssue.state}`
       );
-      if (existingIssue.state === 'closed') {
-        // If there is an existing closed issue, it might be flaky.
+      // Acquire the lock, then fetch the issue and update, release the lock.
+      const lock = new DatastoreLock('flakybot', existingIssue.url);
+      // Ignore the failure because it's not fatal.
+      await lock.acquire();
 
-        // If the issue is locked, we can't reopen it, so open a new one.
-        if (existingIssue.locked) {
-          await flakybot.openNewIssue(
-            context,
-            owner,
-            repo,
-            commit,
-            buildURL,
-            failure,
-            `Note: #${existingIssue.number} was also for this test, but it is locked`
-          );
-          continue;
-        }
+      try {
+        // We need to re fetch the issue.
+        const issue = await context.octokit.issues.get({
+          owner: owner,
+          repo: repo,
+          issue_number: existingIssue.number,
+        });
+        // Work on the refreshed issue.
+        const existingIssueToModify =
+          issue.data as IssuesListForRepoResponseItem;
+        if (existingIssueToModify.state === 'closed') {
+          // If there is an existing closed issue, it might be flaky.
 
-        // If the existing issue has been closed for more than 10 days, open
-        // a new issue instead.
-        //
-        // If this doesn't work, we'll mark the issue as flaky.
-        const closedAt = parseClosedAt(existingIssue.closed_at);
-        if (closedAt) {
-          const daysAgo = 10;
-          const daysAgoDate = new Date();
-          daysAgoDate.setDate(daysAgoDate.getDate() - daysAgo);
-          if (closedAt < daysAgoDate.getTime()) {
+          // If the issue is locked, we can't reopen it, so open a new one.
+          if (existingIssueToModify.locked) {
             await flakybot.openNewIssue(
               context,
+              config,
               owner,
               repo,
               commit,
               buildURL,
               failure,
-              `Note: #${existingIssue.number} was also for this test, but it was closed more than ${daysAgo} days ago. So, I didn't mark it flaky.`
+              `Note: #${existingIssueToModify.number} was also for this test, but it is locked`
             );
             continue;
           }
-        }
-        const reason = flakybot.formatBody(failure, commit, buildURL);
-        await flakybot.markIssueFlaky(
-          existingIssue,
-          context,
-          owner,
-          repo,
-          reason
-        );
-      } else {
-        // Don't comment if it's asked to be quiet.
-        if (hasLabel(existingIssue, QUIET_LABEL)) {
-          continue;
-        }
 
-        // Don't comment if it's flaky.
-        if (flakybot.isFlaky(existingIssue)) {
-          continue;
-        }
+          // If the existing issue has been closed for more than 10 days, open
+          // a new issue instead.
+          //
+          // If this doesn't work, we'll mark the issue as flaky.
+          const closedAt = parseClosedAt(existingIssueToModify.closed_at);
+          if (closedAt) {
+            const daysAgo = 10;
+            const daysAgoDate = new Date();
+            daysAgoDate.setDate(daysAgoDate.getDate() - daysAgo);
+            if (closedAt < daysAgoDate.getTime()) {
+              await flakybot.openNewIssue(
+                context,
+                config,
+                owner,
+                repo,
+                commit,
+                buildURL,
+                failure,
+                `Note: #${existingIssueToModify.number} was also for this test, but it was closed more than ${daysAgo} days ago. So, I didn't mark it flaky.`
+              );
+              continue;
+            }
+          }
+          const reason = flakybot.formatBody(failure, commit, buildURL);
+          await flakybot.markIssueFlaky(
+            existingIssueToModify,
+            context,
+            config,
+            owner,
+            repo,
+            reason
+          );
+        } else {
+          // Don't comment if it's asked to be quiet.
+          if (hasLabel(existingIssueToModify, QUIET_LABEL)) {
+            continue;
+          }
 
-        // Don't comment if we've already commented with this build failure.
-        const [containsFailure] = await flakybot.containsBuildFailure(
-          existingIssue,
-          context,
-          owner,
-          repo,
-          commit
-        );
-        if (containsFailure) {
-          continue;
-        }
+          // Don't comment if it's flaky.
+          if (flakybot.isFlaky(existingIssueToModify)) {
+            continue;
+          }
 
-        await context.octokit.issues.createComment({
-          owner,
-          repo,
-          issue_number: existingIssue.number,
-          body: flakybot.formatBody(failure, commit, buildURL),
-        });
+          // Don't comment if we've already commented with this build failure.
+          const [containsFailure] = await flakybot.containsBuildFailure(
+            existingIssueToModify,
+            context,
+            owner,
+            repo,
+            commit
+          );
+          if (containsFailure) {
+            continue;
+          }
+
+          await context.octokit.issues.createComment({
+            owner,
+            repo,
+            issue_number: existingIssueToModify.number,
+            body: flakybot.formatBody(failure, commit, buildURL),
+          });
+        }
+      } finally {
+        await lock.release();
       }
     }
   }
@@ -485,7 +607,7 @@ flakybot.findExistingIssue = (
     !existingIssue &&
     flakybot.formatTestCase(failure) !== EVERYTHING_FAILED_TITLE
   ) {
-    matchingIssues.sort(flakybot.issueComparator);
+    matchingIssues.sort(flakybot.issueComparatorForFindingExistingIssue);
     existingIssue = matchingIssues[0];
   }
   return existingIssue;
@@ -493,6 +615,7 @@ flakybot.findExistingIssue = (
 
 flakybot.openNewIssue = async (
   context: PubSubContext,
+  config: Config,
   owner: string,
   repo: string,
   commit: string,
@@ -516,10 +639,14 @@ flakybot.openNewIssue = async (
       repo,
       title: flakybot.formatTestCase(failure),
       body,
-      labels: LABELS_FOR_NEW_ISSUE,
+      labels: getLabelsForNewIssue(config),
     })
   ).data;
-  context.log.info(`[${owner}/${repo}]: created issue #${newIssue.number}`);
+  logger.metric('flakybot.open_new_issue', {
+    owner,
+    repo,
+    number: newIssue.number,
+  });
 };
 
 // For every flakybot issue, if it's not flaky and it passed and it didn't
@@ -528,6 +655,7 @@ flakybot.closeIssues = async (
   results: TestResults,
   issues: IssuesListForRepoResponseData,
   context: PubSubContext,
+  config: Config,
   owner: string,
   repo: string,
   commit: string,
@@ -591,7 +719,14 @@ flakybot.closeIssues = async (
     );
     if (containsFailure) {
       const reason = `When run at the same commit (${commit}), this test passed in one build (${buildURL}) and failed in another build (${failureURL}).`;
-      await flakybot.markIssueFlaky(issue, context, owner, repo, reason);
+      await flakybot.markIssueFlaky(
+        issue,
+        context,
+        config,
+        owner,
+        repo,
+        reason
+      );
       break;
     }
 
@@ -641,6 +776,26 @@ flakybot.issueComparator = (
   return a.number - b.number; // Earlier issue number first.
 };
 
+// Add another comparator for handling edge cases described in #2105.
+// Only difference is that this doesn't use `isFlaky` for sorting.
+flakybot.issueComparatorForFindingExistingIssue = (
+  a: IssuesListForRepoResponseItem,
+  b: IssuesListForRepoResponseItem
+) => {
+  if (a.state === 'open' && b.state !== 'open') {
+    return -1;
+  }
+  if (a.state !== 'open' && b.state === 'open') {
+    return 1;
+  }
+  const aClose = parseClosedAt(a.closed_at);
+  const bClose = parseClosedAt(b.closed_at);
+  if (aClose && bClose) {
+    return bClose - aClose; // Later close time first.
+  }
+  return a.number - b.number; // Earlier issue number first.
+};
+
 flakybot.isFlaky = (issue: IssuesListForRepoResponseItem): boolean => {
   return hasLabel(issue, FLAKY_LABEL);
 };
@@ -652,17 +807,27 @@ function hasLabel(
   if (issue.labels === undefined) {
     return false;
   }
-  for (const l of issue.labels) {
-    if (l.name === label) {
+  if (isArray(issue.labels)) {
+    for (const l of issue.labels) {
+      if (l.name === label) {
+        return true;
+      }
+    }
+  }
+
+  if (isString(issue.labels)) {
+    if (issue.labels === label) {
       return true;
     }
   }
+
   return false;
 }
 
 flakybot.markIssueFlaky = async (
   existingIssue: IssuesListForRepoResponseItem,
   context: PubSubContext,
+  config: Config,
   owner: string,
   repo: string,
   reason: string
@@ -670,19 +835,24 @@ flakybot.markIssueFlaky = async (
   context.log.info(
     `[${owner}/${repo}] marking issue #${existingIssue.number} as flaky`
   );
-  const existingLabels = existingIssue.labels
-    ?.map(l => l.name as string) // "as string" is workaround for https://github.com/github/rest-api-description/issues/112
-    .filter(l => !l.startsWith('flakybot'));
-  let labelsToAdd = LABELS_FOR_FLAKY_ISSUE;
-  // If existingLabels contains a priority or type label, don't add the
-  // default priority and type labels.
-  if (existingLabels?.find(l => l.startsWith('priority:'))) {
-    labelsToAdd = labelsToAdd.filter(l => !l.startsWith('priority:'));
+  let existingLabels;
+  let labels;
+  if (isArray(existingIssue.labels)) {
+    existingLabels = existingIssue.labels
+      ?.map(l => l.name) // "as string" is workaround for https://github.com/github/rest-api-description/issues/112
+      .filter(l => !l?.startsWith('flakybot'));
+
+    let labelsToAdd = getLabelsForFlakyIssue(config);
+    // If existingLabels contains a priority or type label, don't add the
+    // default priority and type labels.
+    if (existingLabels?.find(l => l?.startsWith('priority:'))) {
+      labelsToAdd = labelsToAdd.filter(l => !l.startsWith('priority:'));
+    }
+    if (existingLabels?.find(l => l?.startsWith('type:'))) {
+      labelsToAdd = labelsToAdd.filter(l => !l.startsWith('type:'));
+    }
+    labels = labelsToAdd.concat(existingLabels as string[]);
   }
-  if (existingLabels?.find(l => l.startsWith('type:'))) {
-    labelsToAdd = labelsToAdd.filter(l => !l.startsWith('type:'));
-  }
-  const labels = labelsToAdd.concat(existingLabels);
   await context.octokit.issues.update({
     owner,
     repo,
@@ -891,7 +1061,7 @@ function deduplicateTests(tests: TestCase[]): TestCase[] {
 function parseClosedAt(closedAt: string | null): number | undefined {
   // The type of closed_at is null. But, it is actually a string if the
   // issue is closed. Convert to unknown then to string as a workaround.
-  const closedAtString = (closedAt as unknown) as string;
+  const closedAtString = closedAt as unknown as string;
   if (closedAtString) {
     return Date.parse(closedAtString);
   }

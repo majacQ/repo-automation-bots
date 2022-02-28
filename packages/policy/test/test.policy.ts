@@ -17,6 +17,7 @@ import {describe, it, afterEach} from 'mocha';
 import {getPolicy, GitHubRepo, githubRawBase} from '../src/policy';
 import assert from 'assert';
 import sinon from 'sinon';
+// eslint-disable-next-line node/no-extraneous-import
 import {Octokit} from '@octokit/rest';
 
 nock.disableNetConnect();
@@ -296,6 +297,15 @@ describe('policy', () => {
     assert.ok(!isValid);
   });
 
+  it('should check for main as the default branch', async () => {
+    const repo = {
+      full_name: 'googleapis/nodejs-storage',
+      default_branch: 'master',
+    } as GitHubRepo;
+    const isValid = await policy.hasMainDefault(repo);
+    assert.ok(!isValid);
+  });
+
   it('should check for all policy checks', async () => {
     const repo = {
       full_name: 'googleapis/nodejs-storage',
@@ -316,6 +326,7 @@ describe('policy', () => {
       sinon.stub(policy, 'hasBranchProtection').resolves(true),
       sinon.stub(policy, 'hasMergeCommitsDisabled').resolves(true),
       sinon.stub(policy, 'hasSecurityPolicy').resolves(true),
+      sinon.stub(policy, 'hasMainDefault').resolves(true),
     ];
     const result = await policy.checkRepoPolicy(repo);
     const [org, name] = repo.full_name.split('/');
@@ -332,9 +343,41 @@ describe('policy', () => {
       hasBranchProtection: true,
       hasMergeCommitsDisabled: true,
       hasSecurityPolicy: true,
+      hasMainDefault: true,
       timestamp: result.timestamp,
     };
     assert.deepStrictEqual(result, expected);
     stubs.forEach(x => assert.ok(x.calledOnce));
+  });
+
+  it('should raise error if grabbing file tracked by policy fails', async () => {
+    const repo = {
+      full_name: 'googleapis/nodejs-storage',
+      default_branch: 'main',
+      license: {
+        key: 'beerpl',
+      },
+      language: 'ruby',
+    } as GitHubRepo;
+
+    const getSecurityMd = nock('https://raw.githubusercontent.com')
+      .get('/googleapis/nodejs-storage/main/SECURITY.md')
+      .reply(200)
+      .get('/googleapis/nodejs-storage/main/.github/SECURITY.md')
+      .reply(502);
+
+    // we've already individually tested all of these functions, so stub them
+    const stubs = [
+      sinon.stub(policy, 'hasRenovate').resolves(true),
+      sinon.stub(policy, 'hasLicense').resolves(true),
+      sinon.stub(policy, 'hasCodeOfConduct').resolves(true),
+      sinon.stub(policy, 'hasContributing').resolves(true),
+      sinon.stub(policy, 'hasCodeOwners').resolves(true),
+      sinon.stub(policy, 'hasBranchProtection').resolves(true),
+      sinon.stub(policy, 'hasMergeCommitsDisabled').resolves(true),
+      sinon.stub(policy, 'hasMainDefault').resolves(true),
+    ];
+    await assert.rejects(policy.checkRepoPolicy(repo), /received 502 fetching/);
+    getSecurityMd.done();
   });
 });

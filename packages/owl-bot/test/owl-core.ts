@@ -18,6 +18,8 @@ import {execSync} from 'child_process';
 import * as path from 'path';
 import rimraf from 'rimraf';
 import {core} from '../src/core';
+import {OWL_BOT_IGNORE} from '../src/labels';
+import {OWL_BOT_POST_PROCESSOR_COMMIT_MESSAGE} from '../src/constants';
 import nock from 'nock';
 import * as sinon from 'sinon';
 import {mkdirSync, writeFileSync} from 'fs';
@@ -25,37 +27,60 @@ import {mkdirSync, writeFileSync} from 'fs';
 import * as protos from '@google-cloud/cloudbuild/build/protos/protos';
 import {CloudBuildClient} from '@google-cloud/cloudbuild';
 import {Octokit} from '@octokit/rest';
+import {OctokitType} from '../src/octokit-util';
+import {OwlBotLock} from '../src/config-files';
 
 nock.disableNetConnect();
 const sandbox = sinon.createSandbox();
 
-describe('core', () => {
-  beforeEach(() => {
-    const prData = {
-      data: {
-        head: {
-          ref: 'my-feature-branch',
-          repo: {
-            full_name: 'bcoe/example',
-          },
-        },
-      },
-    };
-    sandbox.stub(core, 'getGitHubShortLivedAccessToken').resolves({
-      token: 'abc123',
-      expires_at: '2021-01-13T23:37:43.707Z',
-      permissions: {},
-      repository_selection: 'included',
-    });
-    sandbox.stub(core, 'getAuthenticatedOctokit').resolves(({
-      pulls: {
-        get() {
-          return prData;
-        },
-      },
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    } as any) as InstanceType<typeof Octokit>);
+/**
+ * Stubs out core.getGitHubShortLivedAccessToken and
+ * core.getAuthenticatedOctokit with test values.
+ */
+function initSandbox(prData: unknown) {
+  sandbox.stub(core, 'getGitHubShortLivedAccessToken').resolves({
+    token: 'abc123',
+    expires_at: '2021-01-13T23:37:43.707Z',
+    permissions: {},
+    repository_selection: 'included',
   });
+  sandbox.stub(core, 'getAuthenticatedOctokit').resolves({
+    pulls: {
+      get() {
+        return prData;
+      },
+    },
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  } as any as InstanceType<typeof Octokit>);
+}
+
+async function getOwlBotLock(
+  repoFull: string,
+  pullNumber: number,
+  octokit: OctokitType
+): Promise<OwlBotLock | undefined> {
+  const lockText = await core.fetchOwlBotLock(repoFull, pullNumber, octokit);
+  return undefined === lockText ? undefined : core.parseOwlBotLock(lockText);
+}
+
+function newPrData(labels: string[] = []): unknown {
+  const prData = {
+    data: {
+      head: {
+        ref: 'my-feature-branch',
+        repo: {
+          full_name: 'bcoe/example',
+        },
+      },
+      labels: labels.map(name => {
+        return {name};
+      }),
+    },
+  };
+  return prData;
+}
+
+describe('core', () => {
   afterEach(() => {
     sandbox.restore();
   });
@@ -70,6 +95,7 @@ describe('core', () => {
   });
   describe('triggerBuild', () => {
     it('returns with success if build succeeds', async () => {
+      initSandbox(newPrData());
       const successfulBuild = {
         status: 'SUCCESS',
         steps: [
@@ -82,7 +108,7 @@ describe('core', () => {
       let triggerRequest:
         | protos.google.devtools.cloudbuild.v1.IRunBuildTriggerRequest
         | undefined = undefined;
-      sandbox.stub(core, 'getCloudBuildInstance').returns(({
+      sandbox.stub(core, 'getCloudBuildInstance').returns({
         runBuildTrigger(
           request: protos.google.devtools.cloudbuild.v1.IRunBuildTriggerRequest
         ) {
@@ -101,7 +127,7 @@ describe('core', () => {
           return [successfulBuild];
         },
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      } as any) as CloudBuildClient);
+      } as any as CloudBuildClient);
       const build = await core.triggerPostProcessBuild({
         image: 'node@abc123',
         appId: 12345,
@@ -113,10 +139,30 @@ describe('core', () => {
         trigger: 'abc123',
       });
       assert.ok(triggerRequest);
-      assert.strictEqual(build.conclusion, 'success');
-      assert.strictEqual(build.summary, 'successfully ran 1 steps 🎉!');
+      assert.strictEqual(build!.conclusion, 'success');
+      assert.strictEqual(build!.summary, 'successfully ran 1 steps 🎉!');
     });
+
+    it(
+      "doesn't trigger build when labeled with " + OWL_BOT_IGNORE,
+      async () => {
+        initSandbox(newPrData([OWL_BOT_IGNORE]));
+        const build = await core.triggerPostProcessBuild({
+          image: 'node@abc123',
+          appId: 12345,
+          privateKey: 'abc123',
+          installation: 12345,
+          repo: 'bcoe/example',
+          pr: 99,
+          project: 'fake-project',
+          trigger: 'abc123',
+        });
+        assert.strictEqual(build, null);
+      }
+    );
+
     it('returns with failure if build fails', async () => {
+      initSandbox(newPrData());
       const successfulBuild = {
         status: 'FAILURE',
         steps: [
@@ -129,7 +175,7 @@ describe('core', () => {
       let triggerRequest:
         | protos.google.devtools.cloudbuild.v1.IRunBuildTriggerRequest
         | undefined = undefined;
-      sandbox.stub(core, 'getCloudBuildInstance').returns(({
+      sandbox.stub(core, 'getCloudBuildInstance').returns({
         runBuildTrigger(
           request: protos.google.devtools.cloudbuild.v1.IRunBuildTriggerRequest
         ) {
@@ -148,7 +194,7 @@ describe('core', () => {
           return [successfulBuild];
         },
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      } as any) as CloudBuildClient);
+      } as any as CloudBuildClient);
       const build = await core.triggerPostProcessBuild({
         image: 'node@abc123',
         appId: 12345,
@@ -160,8 +206,8 @@ describe('core', () => {
         trigger: 'abc123',
       });
       assert.ok(triggerRequest);
-      assert.strictEqual(build.conclusion, 'failure');
-      assert.strictEqual(build.summary, '1 steps failed 🙁');
+      assert.strictEqual(build!.conclusion, 'failure');
+      assert.strictEqual(build!.summary, '1 steps failed 🙁');
     });
   });
   describe('getOwlBotLock', () => {
@@ -185,7 +231,7 @@ describe('core', () => {
           encoding: 'base64',
         },
       };
-      const octokit = ({
+      const octokit = {
         pulls: {
           get() {
             return prData;
@@ -197,8 +243,8 @@ describe('core', () => {
           },
         },
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      } as any) as InstanceType<typeof Octokit>;
-      const lock = await core.getOwlBotLock('bcoe/test', 22, octokit);
+      } as any as InstanceType<typeof Octokit>;
+      const lock = await getOwlBotLock('bcoe/test', 22, octokit);
       assert.strictEqual(lock!.docker.image, 'node');
       assert.strictEqual(
         lock!.docker.digest,
@@ -225,7 +271,7 @@ describe('core', () => {
           encoding: 'base64',
         },
       };
-      const octokit = ({
+      const octokit = {
         pulls: {
           get() {
             return prData;
@@ -237,8 +283,8 @@ describe('core', () => {
           },
         },
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      } as any) as InstanceType<typeof Octokit>;
-      assert.rejects(core.getOwlBotLock('bcoe/test', 22, octokit));
+      } as any as InstanceType<typeof Octokit>;
+      assert.rejects(getOwlBotLock('bcoe/test', 22, octokit));
     });
     it('returns "undefined" if config not found', async () => {
       const prData = {
@@ -251,7 +297,7 @@ describe('core', () => {
           },
         },
       };
-      const octokit = ({
+      const octokit = {
         pulls: {
           get() {
             return prData;
@@ -263,8 +309,8 @@ describe('core', () => {
           },
         },
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      } as any) as InstanceType<typeof Octokit>;
-      const config = await core.getOwlBotLock('bcoe/test', 22, octokit);
+      } as any as InstanceType<typeof Octokit>;
+      const config = await getOwlBotLock('bcoe/test', 22, octokit);
       assert.strictEqual(config, undefined);
     });
   });
@@ -364,67 +410,111 @@ describe('core', () => {
     });
   });
   describe('hasOwlBotLoop', () => {
+    /** A helper function for simulating a date-ordered list of commits */
+    function generateCommitList(commitOrderByMessage: string[]) {
+      const commits: {
+        commit: {
+          author: {
+            date: string;
+          };
+          message: string;
+        };
+      }[] = [];
+
+      for (let i = 0; i < commitOrderByMessage.length; i++) {
+        commits.push({
+          commit: {
+            author: {
+              date: new Date(i).toISOString(),
+            },
+            message: commitOrderByMessage[i],
+          },
+        });
+      }
+
+      return commits;
+    }
+
     it('returns false if post processor not looping', async () => {
-      const commits = [
-        // Two PRs from gcf-owl-bot[bot] are expected: a PR to
-        // submit files, followed by a commit from the post processor:
-        {
-          author: {
-            login: 'gcf-owl-bot[bot]',
-          },
-        },
-        {
-          author: {
-            login: 'gcf-owl-bot[bot]',
-          },
-        },
-        {
-          author: {
-            login: 'bcoe',
-          },
-        },
-        {
-          author: {
-            login: 'gcf-owl-bot[bot]',
-          },
-        },
-      ];
+      // Doesn't break post-processor loop if other commits
+      // occur in between post-processor commits:
+      const commits = generateCommitList([
+        OWL_BOT_POST_PROCESSOR_COMMIT_MESSAGE,
+        OWL_BOT_POST_PROCESSOR_COMMIT_MESSAGE,
+        'some other commit from user',
+        OWL_BOT_POST_PROCESSOR_COMMIT_MESSAGE,
+        OWL_BOT_POST_PROCESSOR_COMMIT_MESSAGE,
+        OWL_BOT_POST_PROCESSOR_COMMIT_MESSAGE,
+      ]);
+
       const githubMock = nock('https://api.github.com')
-        .get('/repos/bcoe/foo/pulls/22/commits')
+        .get('/repos/bcoe/foo/pulls/22/commits?per_page=100')
         .reply(200, commits);
       const loop = await core.hasOwlBotLoop('bcoe', 'foo', 22, new Octokit());
       assert.strictEqual(loop, false);
       githubMock.done();
     });
+
     it('returns true if post processor looping', async () => {
-      const commits = [
-        // Three commits from OwlBot in a row should not happen:
-        {
-          author: {
-            login: 'gcf-owl-bot[bot]',
-          },
-        },
-        {
-          author: {
-            login: 'gcf-owl-bot[bot]',
-          },
-        },
-        {
-          author: {
-            login: 'gcf-owl-bot[bot]',
-          },
-        },
-        {
-          author: {
-            login: 'bcoe',
-          },
-        },
-      ];
+      const commits = generateCommitList([
+        'some other commit',
+        OWL_BOT_POST_PROCESSOR_COMMIT_MESSAGE,
+        'another userland commit',
+        OWL_BOT_POST_PROCESSOR_COMMIT_MESSAGE,
+        OWL_BOT_POST_PROCESSOR_COMMIT_MESSAGE,
+        OWL_BOT_POST_PROCESSOR_COMMIT_MESSAGE,
+        OWL_BOT_POST_PROCESSOR_COMMIT_MESSAGE,
+        OWL_BOT_POST_PROCESSOR_COMMIT_MESSAGE, // this commit should trigger the breaker
+      ]);
+
       const githubMock = nock('https://api.github.com')
-        .get('/repos/bcoe/foo/pulls/22/commits')
+        .get('/repos/bcoe/foo/pulls/22/commits?per_page=100')
         .reply(200, commits);
       const loop = await core.hasOwlBotLoop('bcoe', 'foo', 22, new Octokit());
       assert.strictEqual(loop, true);
+      githubMock.done();
+    });
+
+    it('returns false if there was a loop in the past, but not within the last few commits', async () => {
+      const commits = generateCommitList([
+        'commit 1',
+        OWL_BOT_POST_PROCESSOR_COMMIT_MESSAGE,
+        'commit 2',
+        OWL_BOT_POST_PROCESSOR_COMMIT_MESSAGE,
+        OWL_BOT_POST_PROCESSOR_COMMIT_MESSAGE,
+        OWL_BOT_POST_PROCESSOR_COMMIT_MESSAGE,
+        OWL_BOT_POST_PROCESSOR_COMMIT_MESSAGE,
+        OWL_BOT_POST_PROCESSOR_COMMIT_MESSAGE,
+        'commit 3, this is fine 🔥', // this commit should break the loop
+      ]);
+
+      const githubMock = nock('https://api.github.com')
+        .get('/repos/bcoe/foo/pulls/22/commits?per_page=100')
+        .reply(200, commits);
+      const loop = await core.hasOwlBotLoop('bcoe', 'foo', 22, new Octokit());
+      assert.strictEqual(loop, false);
+      githubMock.done();
+    });
+
+    it('returns false if there were less than the number of commits from the circuit breaker', async () => {
+      const commits = generateCommitList([
+        OWL_BOT_POST_PROCESSOR_COMMIT_MESSAGE,
+      ]);
+
+      const githubMock = nock('https://api.github.com')
+        .get('/repos/bcoe/foo/pulls/22/commits?per_page=100')
+        .reply(200, commits);
+      const loop = await core.hasOwlBotLoop('bcoe', 'foo', 22, new Octokit());
+      assert.strictEqual(loop, false);
+      githubMock.done();
+    });
+
+    it('returns false if there were 0 commits in the PR', async () => {
+      const githubMock = nock('https://api.github.com')
+        .get('/repos/bcoe/foo/pulls/22/commits?per_page=100')
+        .reply(200, []);
+      const loop = await core.hasOwlBotLoop('bcoe', 'foo', 22, new Octokit());
+      assert.strictEqual(loop, false);
       githubMock.done();
     });
   });

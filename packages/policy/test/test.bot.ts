@@ -12,18 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-/* eslint-disable node/no-extraneous-import */
-
+// eslint-disable-next-line node/no-extraneous-import
 import {Probot, createProbot, ProbotOctokit} from 'probot';
+// eslint-disable-next-line node/no-extraneous-import
 import {Octokit} from '@octokit/rest';
 import nock from 'nock';
 import sinon from 'sinon';
 import {describe, it, afterEach, beforeEach} from 'mocha';
 import * as assert from 'assert';
+import {logger} from 'gcf-utils';
 import * as policy from '../src/policy';
 import * as bq from '../src/export';
 import * as changer from '../src/changer';
 import {policyBot} from '../src/bot';
+import * as gh from '../src/issue';
 
 nock.disableNetConnect();
 
@@ -52,7 +54,8 @@ describe('bot', () => {
     const repo = 'nodejs-storage';
     const org = 'not-an-approved-org';
     await probot.receive({
-      name: 'schedule.repository' as '*',
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      name: 'schedule.repository' as any,
       payload: {
         repository: {
           name: repo,
@@ -64,29 +67,35 @@ describe('bot', () => {
           login: org,
         },
         cron_org: org,
-      },
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } as any,
       id: 'abc123',
     });
     // we are relying on the lack of nocks or stubs to signal that this exited
     // successfully, skipping all of the interesting stuff.
   });
 
-  it('runs the check and saves the result', async () => {
+  it('should run the check and saves the result', async () => {
     const repo = 'nodejs-storage';
     const org = 'googleapis';
-    const fakeRepo = {} as policy.GitHubRepo;
+    const fakeRepo = {
+      full_name: 'googleapis/nodejs-storage',
+    } as policy.GitHubRepo;
     const fakeResult = {} as policy.PolicyResult;
     const p = new policy.Policy(new Octokit(), console);
+    const c = new changer.Changer(new Octokit(), fakeRepo);
     const getPolicyStub = sinon.stub(policy, 'getPolicy').returns(p);
+    const getChangerStub = sinon.stub(changer, 'getChanger').returns(c);
     const getRepoStub = sinon.stub(p, 'getRepo').resolves(fakeRepo);
     const checkPolicyStub = sinon
       .stub(p, 'checkRepoPolicy')
       .resolves(fakeResult);
     const exportStub = sinon.stub(bq, 'exportToBigQuery').resolves();
-    const submitFixesStub = sinon.stub(changer, 'submitFixes').resolves();
+    const submitFixesStub = sinon.stub(c, 'submitFixes').resolves();
 
     await probot.receive({
-      name: 'schedule.repository' as '*',
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      name: 'schedule.repository' as any,
       payload: {
         repository: {
           name: repo,
@@ -98,14 +107,100 @@ describe('bot', () => {
           login: org,
         },
         cron_org: org,
-      },
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } as any,
       id: 'abc123',
     });
+    assert.ok(getPolicyStub.calledOnce);
+    assert.ok(getChangerStub.calledOnce);
+    assert.ok(getRepoStub.calledOnce);
+    assert.ok(checkPolicyStub.calledOnce);
+    assert.ok(exportStub.calledOnce);
+    assert.ok(submitFixesStub.calledOnce);
+  });
+
+  it('should run checks for sample repos in GoogleCloudPlatform', async () => {
+    const repo = 'nodejs-docs-samples';
+    const org = 'GoogleCloudPlatform';
+    const fakeRepo = {
+      topics: ['samples'],
+      full_name: 'googleapis/nodejs-storage',
+    } as policy.GitHubRepo;
+    const fakeResult = {} as policy.PolicyResult;
+    const p = new policy.Policy(new Octokit(), console);
+    const c = new changer.Changer(new Octokit(), fakeRepo);
+    const getPolicyStub = sinon.stub(policy, 'getPolicy').returns(p);
+    const getChangerStub = sinon.stub(changer, 'getChanger').returns(c);
+    const getRepoStub = sinon.stub(p, 'getRepo').resolves(fakeRepo);
+    const checkPolicyStub = sinon
+      .stub(p, 'checkRepoPolicy')
+      .resolves(fakeResult);
+    const exportStub = sinon.stub(bq, 'exportToBigQuery').resolves();
+    const submitFixesStub = sinon.stub(c, 'submitFixes').resolves();
+
+    await probot.receive({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      name: 'schedule.repository' as any,
+      payload: {
+        repository: {
+          name: repo,
+          owner: {
+            login: org,
+          },
+        },
+        organization: {
+          login: org,
+        },
+        cron_org: org,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } as any,
+      id: 'abc123',
+    });
+    assert.ok(getChangerStub.calledOnce);
     assert.ok(getPolicyStub.calledOnce);
     assert.ok(getRepoStub.calledOnce);
     assert.ok(checkPolicyStub.calledOnce);
     assert.ok(exportStub.calledOnce);
     assert.ok(submitFixesStub.calledOnce);
+  });
+
+  it('should raise error if checkRepoPolicy throws', async () => {
+    const repo = 'nodejs-docs-samples';
+    const org = 'GoogleCloudPlatform';
+    const fakeRepo = {
+      topics: ['samples'],
+      full_name: 'googleapis/nodejs-storage',
+    } as policy.GitHubRepo;
+    const p = new policy.Policy(new Octokit(), console);
+    const getPolicyStub = sinon.stub(policy, 'getPolicy').returns(p);
+    const getRepoStub = sinon.stub(p, 'getRepo').resolves(fakeRepo);
+    const checkPolicyStub = sinon
+      .stub(p, 'checkRepoPolicy')
+      .throws(Error('reading file failed'));
+    await assert.rejects(
+      probot.receive({
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        name: 'schedule.repository' as any,
+        payload: {
+          repository: {
+            name: repo,
+            owner: {
+              login: org,
+            },
+          },
+          organization: {
+            login: org,
+          },
+          cron_org: org,
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        } as any,
+        id: 'abc123',
+      }),
+      /reading file failed/
+    );
+    assert.ok(getPolicyStub.calledOnce);
+    assert.ok(getRepoStub.calledOnce);
+    assert.ok(checkPolicyStub.calledOnce);
   });
 
   it('should skip archived repos', async () => {
@@ -116,7 +211,8 @@ describe('bot', () => {
     const getPolicyStub = sinon.stub(policy, 'getPolicy').returns(p);
     const getRepoStub = sinon.stub(p, 'getRepo').resolves(fakeRepo);
     await probot.receive({
-      name: 'schedule.repository' as '*',
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      name: 'schedule.repository' as any,
       payload: {
         repository: {
           name: repo,
@@ -128,7 +224,8 @@ describe('bot', () => {
           login: org,
         },
         cron_org: org,
-      },
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } as any,
       id: 'abc123',
     });
     assert.ok(getRepoStub.calledOnce);
@@ -143,7 +240,8 @@ describe('bot', () => {
     const getPolicyStub = sinon.stub(policy, 'getPolicy').returns(p);
     const getRepoStub = sinon.stub(p, 'getRepo').resolves(fakeRepo);
     await probot.receive({
-      name: 'schedule.repository' as '*',
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      name: 'schedule.repository' as any,
       payload: {
         repository: {
           name: repo,
@@ -155,10 +253,88 @@ describe('bot', () => {
           login: org,
         },
         cron_org: org,
-      },
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } as any,
       id: 'abc123',
     });
     assert.ok(getRepoStub.calledOnce);
     assert.ok(getPolicyStub.calledOnce);
+  });
+
+  it('should skip GoogleCloudPlatform repos without magic repo topics', async () => {
+    const repo = 'nodejs-storage';
+    const org = 'GoogleCloudPlatform';
+    const fakeRepo = {} as policy.GitHubRepo;
+    const p = new policy.Policy(new Octokit(), console);
+    const getPolicyStub = sinon.stub(policy, 'getPolicy').returns(p);
+    const getRepoStub = sinon.stub(p, 'getRepo').resolves(fakeRepo);
+    await probot.receive({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      name: 'schedule.repository' as any,
+      payload: {
+        repository: {
+          name: repo,
+          owner: {
+            login: org,
+          },
+        },
+        organization: {
+          login: org,
+        },
+        cron_org: org,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } as any,
+      id: 'abc123',
+    });
+    assert.ok(getRepoStub.calledOnce);
+    assert.ok(getPolicyStub.calledOnce);
+  });
+
+  it('should still succeed if submitFixes fails, and log a result', async () => {
+    const repo = 'nodejs-storage';
+    const org = 'googleapis';
+    const fakeRepo = {
+      full_name: 'googleapis/nodejs-storage',
+    } as policy.GitHubRepo;
+    const fakeResult = {} as policy.PolicyResult;
+    const p = new policy.Policy(new Octokit(), console);
+    const c = new changer.Changer(new Octokit(), fakeRepo);
+    const getPolicyStub = sinon.stub(policy, 'getPolicy').returns(p);
+    const getChangerStub = sinon.stub(changer, 'getChanger').returns(c);
+    const getRepoStub = sinon.stub(p, 'getRepo').resolves(fakeRepo);
+    const checkPolicyStub = sinon
+      .stub(p, 'checkRepoPolicy')
+      .resolves(fakeResult);
+    const exportStub = sinon.stub(bq, 'exportToBigQuery').resolves();
+    const submitFixesStub = sinon.stub(c, 'submitFixes').throws();
+    const openIssueStub = sinon.stub(gh, 'openIssue').resolves();
+    const errStub = sinon.stub(logger, 'error');
+
+    await probot.receive({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      name: 'schedule.repository' as any,
+      payload: {
+        repository: {
+          name: repo,
+          owner: {
+            login: org,
+          },
+        },
+        organization: {
+          login: org,
+        },
+        cron_org: org,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } as any,
+      id: 'abc123',
+    });
+    assert.ok(getChangerStub.calledOnce);
+    assert.ok(getPolicyStub.calledOnce);
+    assert.ok(getRepoStub.calledOnce);
+    assert.ok(checkPolicyStub.calledOnce);
+    assert.ok(exportStub.calledOnce);
+    assert.ok(submitFixesStub.calledOnce);
+    assert.ok(errStub.calledOnce);
+    assert.ok(openIssueStub.calledOnce);
   });
 });

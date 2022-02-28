@@ -159,12 +159,32 @@ permissionRules:
 
 `
 
+exports['Runner updateWorkflows updates pull request branch lists 1'] = `
+'on':
+  push: null
+  pull_request:
+    branches:
+      - 1.x
+      - other
+
+`
+
+exports['Runner updateWorkflows updates push branch lists 1'] = `
+'on':
+  push:
+    branches:
+      - 1.x
+      - other
+  pull_request: null
+
+`
+
 exports['pr-changes'] = [
   [
     ".github/release-please.yml",
     {
       "mode": "100644",
-      "content": "releaseType: java-yoshi\nbumpMinorPreMajor: true\nbranches:\n  - releaseType: java-yoshi\n    bumpMinorPreMajor: true\n    branch: 1.x\n"
+      "content": "releaseType: java-yoshi\nbumpMinorPreMajor: true\nbranches:\n  - releaseType: java-lts\n    bumpMinorPreMajor: true\n    branch: 1.x\n"
     }
   ],
   [
@@ -176,6 +196,23 @@ exports['pr-changes'] = [
   ]
 ]
 
+exports['pr-changes-with-title-override'] = [
+  [
+    ".github/release-please.yml",
+    {
+      "mode": "100644",
+      "content": "releaseType: java-yoshi\nbumpMinorPreMajor: true\nbranches:\n  - releaseType: java-backport\n    bumpMinorPreMajor: true\n    branch: 1.3.x\n"
+    }
+  ],
+  [
+    ".github/sync-repo-settings.yaml",
+    {
+      "mode": "100644",
+      "content": "rebaseMergeAllowed: false\nsquashMergeAllowed: true\nmergeCommitAllowed: false\nbranchProtectionRules:\n  - pattern: master\n    isAdminEnforced: true\n    requiredApprovingReviewCount: 1\n    requiresCodeOwnerReviews: true\n    requiresStrictStatusChecks: false\n    requiredStatusCheckContexts:\n      - dependencies (8)\n      - dependencies (11)\n      - linkage-monitor\n      - lint\n      - clirr\n      - units (7)\n      - units (8)\n      - units (11)\n      - 'Kokoro - Test: Integration'\n      - cla/google\n  - pattern: 1.3.x\n    isAdminEnforced: true\n    requiredApprovingReviewCount: 1\n    requiresCodeOwnerReviews: true\n    requiresStrictStatusChecks: false\n    requiredStatusCheckContexts:\n      - dependencies (8)\n      - dependencies (11)\n      - linkage-monitor\n      - lint\n      - clirr\n      - units (7)\n      - units (8)\n      - units (11)\n      - 'Kokoro - Test: Integration'\n      - cla/google\npermissionRules:\n  - team: yoshi-admins\n    permission: admin\n  - team: yoshi-java-admins\n    permission: admin\n  - team: yoshi-java\n    permission: push\n"
+    }
+  ]
+]
+
 exports['pr-options'] = {
   "upstreamRepo": "testRepo",
   "upstreamOwner": "testOwner",
@@ -183,6 +220,77 @@ exports['pr-options'] = {
   "title": "build: configure branch 1.x as a release branch",
   "description": "enable releases",
   "branch": "release-brancher/1.x",
+  "force": true,
+  "fork": false,
+  "primary": "master"
+}
+
+exports['pr-options-with-title-override'] = {
+  "upstreamRepo": "testRepo",
+  "upstreamOwner": "testOwner",
+  "message": "feat: next release from default branch is 1.4.0",
+  "title": "feat: next release from default branch is 1.4.0",
+  "description": "enable releases",
+  "branch": "release-brancher/1.3.x",
+  "force": true,
+  "fork": false,
+  "primary": "master"
+}
+
+exports['workflows-pr-changes'] = [
+  [
+    ".github/workflows/ci.yaml",
+    {
+      "mode": "100644",
+      "content": "'on':\n  push:\n    branches:\n      - 1.x\n      - other\n  pull_request: null\n"
+    }
+  ]
+]
+
+exports['workflows-pr-changes-java-backport'] = [
+  [
+    ".github/workflows/ci.yaml",
+    {
+      "mode": "100644",
+      "content": "'on':\n  push:\n    branches:\n      - 1.x\n      - other\n  pull_request: null\n"
+    }
+  ]
+]
+
+exports['workflows-pr-no-changes'] = []
+
+exports['workflows-pr-no-options'] = {
+  "upstreamRepo": "testRepo",
+  "upstreamOwner": "testOwner",
+  "message": "feat: configure the protected branch",
+  "title": "feat: configure the protected branch",
+  "description": "Configures CI for branch",
+  "branch": "release-brancher/ci/1.x",
+  "primary": "1.x",
+  "force": true,
+  "fork": false
+}
+
+exports['workflows-pr-options'] = {
+  "upstreamRepo": "testRepo",
+  "upstreamOwner": "testOwner",
+  "message": "feat: configure the protected branch",
+  "title": "feat: configure the protected branch",
+  "description": "Configures CI for branch",
+  "branch": "release-brancher/ci/1.x",
+  "primary": "1.x",
+  "force": true,
+  "fork": false
+}
+
+exports['workflows-pr-options-java-backport'] = {
+  "upstreamRepo": "testRepo",
+  "upstreamOwner": "testOwner",
+  "message": "ci: configure the protected branch",
+  "title": "ci: configure the protected branch",
+  "description": "Configures CI for branch",
+  "branch": "release-brancher/ci/1.x",
+  "primary": "1.x",
   "force": true,
   "fork": false
 }

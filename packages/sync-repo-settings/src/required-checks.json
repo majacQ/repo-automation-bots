@@ -7,7 +7,6 @@
         "requiredStatusCheckContexts": [
           "dependencies (8)",
           "dependencies (11)",
-          "linkage-monitor",
           "lint",
           "clirr",
           "units (7)",
@@ -43,8 +42,17 @@
         "requiresCodeOwnerReviews": true,
         "requiresStrictStatusChecks": true,
         "requiredStatusCheckContexts": [
-          "Kokoro",
-          "cla/google"
+          "cla/google",
+          "OwlBot Post Processor",
+          "docs",
+          "docfx",
+          "lint",
+          "unit (3.6)",
+          "unit (3.7)",
+          "unit (3.8)",
+          "unit (3.9)",
+          "unit (3.10)",
+          "cover"
         ]
       }
     ],
@@ -64,27 +72,11 @@
       {
         "team": "python-samples-owners",
         "permission": "push"
-      }
-    ],
-    "repoOverrides": [
+      },
       {
-        "repo": "googleapis/python-bigtable",
-        "branchProtectionRules": [
-          {
-            "requiresStrictStatusChecks": false,
-            "requiredStatusCheckContexts": [
-              "Kokoro",
-              "cla/google"
-            ]
-          }
-        ]
+        "team": "python-samples-reviewers",
+        "permission": "push"
       }
-    ],
-    "ignoredRepos": [
-      "GoogleCloudPlatform/python-docs-samples",
-      "GoogleCloudPlatform/getting-started-python",
-      "googleapis/sample-tester",
-      "googleapis/google-cloud-python"
     ]
   },
   "nodejs": {
@@ -100,9 +92,10 @@
           "test (10)",
           "test (12)",
           "test (14)",
-          "test (15)",
+          "test (16)",
           "cla/google",
-          "windows"
+          "windows",
+          "OwlBot Post Processor"
         ]
       }
     ],
@@ -119,54 +112,6 @@
         "team": "yoshi-nodejs",
         "permission": "push"
       }
-    ],
-    "ignoredRepos": [
-      "GoogleCloudPlatform/nodejs-docs-samples",
-      "GoogleCloudPlatform/nodejs-getting-started",
-      "googleapis/google-cloud-node",
-      "googleapis/gapic-generator-typescript",
-      "googleapis/aip",
-      "googleapis/release-please",
-      "google-cloudevents-nodejs"
-    ]
-  },
-  "ruby": {
-    "branchProtectionRules": [
-      {
-        "requiresStrictStatusChecks": true,
-        "requiredStatusCheckContexts": [
-          "OSx",
-          "Ubuntu",
-          "Windows",
-          "cla/google"
-        ]
-      }
-    ],
-    "permissionRules": [
-      {
-        "team": "yoshi-admins",
-        "permission": "admin"
-      },
-      {
-        "team": "yoshi-ruby-admins",
-        "permission": "admin"
-      },
-      {
-        "team": "yoshi-ruby",
-        "permission": "push"
-      }
-    ],
-    "ignoredRepos": [
-      "googleapis/discovery-artifact-manager",
-      "googleapis/gax-ruby",
-      "googleapis/google-api-ruby-client",
-      "googleapis/google-auth-library-ruby",
-      "googleapis/google-cloud-ruby",
-      "googleapis/ruby-style",
-      "googleapis/signet",
-      "googleapis/gapic-generator-ruby",
-      "GoogleCloudPlatform/ruby-docs-samples",
-      "GoogleCloudPlatform/getting-started-ruby"
     ]
   }
 }

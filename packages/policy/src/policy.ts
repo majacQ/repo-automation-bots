@@ -24,10 +24,14 @@
  */
 
 import {request} from 'gaxios';
-import {operations} from '@octokit/openapi-types';
+// eslint-disable-next-line node/no-extraneous-import
 import {Octokit} from '@octokit/rest';
+// eslint-disable-next-line node/no-extraneous-import
+import {Endpoints} from '@octokit/types';
 
-export type GitHubRepo = operations['repos/get']['responses']['200']['content']['application/json'];
+export type GitHubRepo =
+  Endpoints['GET /repos/{owner}/{repo}']['response']['data'];
+
 export const githubRawBase = 'https://raw.githubusercontent.com';
 
 export interface PolicyResult {
@@ -79,6 +83,10 @@ export interface PolicyResult {
    * Does the repository have a SECURITY file available?
    */
   hasSecurityPolicy: boolean;
+  /**
+   * Is the default branch set to `main`, and not `master`?
+   */
+  hasMainDefault: boolean;
   /**
    * Date when the scan was run for this repository
    */
@@ -135,7 +143,7 @@ export class Policy {
       if (res.data.incomplete_results) {
         this.logger.warn(`Incomplete results from repo query: ${search}`);
       }
-      repos.push(...((res.data.items as {}[]) as GitHubRepo[]));
+      repos.push(...(res.data.items as {}[] as GitHubRepo[]));
       if (res.data.items.length < 100) {
         break;
       }
@@ -145,7 +153,7 @@ export class Policy {
 
   /**
    * Given a relative path, search a given GitHub repository for the file.
-   * @param repo Repostiory metadata from GitHub
+   * @param repo Repository metadata from GitHub
    * @param file Relative path to the root of the GitHub repository to find
    * @param checkMagicFolder Also search the `.github` folder for a file
    */
@@ -170,7 +178,11 @@ export class Policy {
         });
       })
     );
-    const good = results.filter(x => x.status === 200);
+    const good = results.filter(x => {
+      if (x.status >= 500)
+        throw Error(`received ${x.status} fetching ${file} in ${repo}`);
+      return x.status === 200;
+    });
     return good.length > 0;
   }
 
@@ -194,7 +206,8 @@ export class Policy {
    */
   async hasBranchProtection(repo: GitHubRepo) {
     const [owner, name] = repo.full_name.split('/');
-    type GetBranchProtectionResult = operations['repos/get-branch-protection']['responses']['200']['content']['application/json'];
+    type GetBranchProtectionResult =
+      Endpoints['GET /repos/{owner}/{repo}/branches/{branch}/protection']['response']['data'];
     let data: GetBranchProtectionResult;
     try {
       const res = await this.octokit.repos.getBranchProtection({
@@ -204,9 +217,10 @@ export class Policy {
       });
       data = res.data;
     } catch (e) {
+      const err = e as Error;
       console.error(
         `Error checking branch protection for ${repo.full_name}`,
-        e.toString()
+        err.toString()
       );
       // no branch protection at all 😱
       return false;
@@ -247,6 +261,13 @@ export class Policy {
    */
   async hasSecurityPolicy(repo: GitHubRepo) {
     return this.checkFileExists(repo, 'SECURITY.md', true);
+  }
+
+  /**
+   * Ensure `main` is the default branch name.
+   */
+  async hasMainDefault(repo: GitHubRepo) {
+    return repo.default_branch === 'main';
   }
 
   /**
@@ -300,6 +321,7 @@ export class Policy {
       hasBranchProtection,
       hasMergeCommitsDisabled,
       hasSecurityPolicy,
+      hasMainDefault,
     ] = await Promise.all([
       this.hasRenovate(repo),
       this.hasLicense(repo),
@@ -309,6 +331,7 @@ export class Policy {
       this.hasBranchProtection(repo),
       this.hasMergeCommitsDisabled(repo),
       this.hasSecurityPolicy(repo),
+      this.hasMainDefault(repo),
     ]);
     const [org, name] = repo.full_name.split('/');
     const results: PolicyResult = {
@@ -322,6 +345,7 @@ export class Policy {
       hasContributing,
       hasCodeowners,
       hasBranchProtection,
+      hasMainDefault,
       hasMergeCommitsDisabled,
       hasSecurityPolicy,
       timestamp: new Date(),

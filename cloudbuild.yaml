@@ -13,15 +13,10 @@
 # limitations under the License.
 
 steps:
-  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
-    id: "sync-triggers"
-    entrypoint: bash
+  - name: gcr.io/$PROJECT_ID/trigger-sync
+    env:
+      - "REPO_NAME=$REPO_NAME"
+      - "BRANCH_NAME=$BRANCH_NAME"
+      - "PROJECT_ID=$PROJECT_ID"
     args:
-      - "-e"
-      - "./scripts/sync-triggers.sh"
-      - "$PROJECT_ID"
-      - "$_BUCKET"
-      - "$_FUNCTION_REGION"
-      - "$_KEY_RING"
-      - "$_REGION"
-      - "$_SCHEDULER_SERVICE_ACCOUNT_EMAIL"
+      - "_BUCKET=$_BUCKET,_FUNCTION_REGION=$_FUNCTION_REGION,_KEY_RING=$_KEY_RING,_REGION=$_REGION,_SCHEDULER_SERVICE_ACCOUNT_EMAIL=$_SCHEDULER_SERVICE_ACCOUNT_EMAIL"

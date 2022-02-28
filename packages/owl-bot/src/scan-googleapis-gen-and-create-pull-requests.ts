@@ -12,21 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import {ConfigsStore} from './configs-store';
+import {AffectedRepo, ConfigsStore, OwlBotYamlAndPath} from './configs-store';
 import {OctokitType, OctokitFactory} from './octokit-util';
 import tmp from 'tmp';
 import {
-  copyCodeAndCreatePullRequest,
-  copyExists,
-  newCmd,
+  copyCodeAndAppendOrCreatePullRequest,
+  copyTagFrom,
   toLocalRepo,
 } from './copy-code';
 import {getFilesModifiedBySha} from '.';
-import {GithubRepo} from './github-repo';
-import {OwlBotYaml} from './config-files';
+import {newCmd} from './cmd';
+import {CopyStateStore} from './copy-state-store';
 
 interface Todo {
-  repo: GithubRepo;
+  repo: AffectedRepo;
   commitHash: string;
 }
 
@@ -41,11 +40,19 @@ interface Todo {
  *                     in order from newest to oldest.
  */
 function isCommitHashTooOld(
-  yaml: OwlBotYaml | undefined,
+  yamls: OwlBotYamlAndPath[] | undefined,
   commitIndex: number,
   commitHashes: string[]
 ): boolean {
-  const beginAfterCommitHash = yaml?.['begin-after-commit-hash']?.trim() ?? '';
+  // Compare to begin-after-commit-hash declared in .OwlBot.yaml.
+  let beginAfterCommitHash = '';
+  for (const yaml of yamls ?? []) {
+    const hash = yaml.yaml['begin-after-commit-hash']?.trim();
+    if (hash) {
+      beginAfterCommitHash = hash;
+      break;
+    }
+  }
   const beginIndex = beginAfterCommitHash
     ? commitHashes.indexOf(beginAfterCommitHash)
     : -1;
@@ -56,19 +63,27 @@ function isCommitHashTooOld(
  * Scans googleapis-gen and creates pull requests in target repos
  * (ex: nodejs-vision) when corresponding code has been updated.
  * @param sourceRepo normally 'googleapis/googlapis-gen'
+ * @param copyExistsSearchDepth how far into past pull requests and issues to search
  */
 export async function scanGoogleapisGenAndCreatePullRequests(
   sourceRepo: string,
   octokitFactory: OctokitFactory,
   configsStore: ConfigsStore,
   cloneDepth = 100,
+  copyStateStore: CopyStateStore,
   logger = console
 ): Promise<number> {
   // Clone the source repo.
   const workDir = tmp.dirSync().name;
   // cloneDepth + 1 because the final commit in a shallow clone is grafted: it contains
   // the combined state of all earlier commits, so we don't want to examine it.
-  const sourceDir = toLocalRepo(sourceRepo, workDir, logger, cloneDepth + 1);
+  const sourceDir = toLocalRepo(
+    sourceRepo,
+    workDir,
+    logger,
+    cloneDepth + 1,
+    await octokitFactory.getGitHubShortLivedAccessToken()
+  );
 
   // Collect the history of commit hashes.
   const cmd = newCmd(logger);
@@ -100,19 +115,31 @@ export async function scanGoogleapisGenAndCreatePullRequests(
     logger.info(`affecting ${repos.length} repos.`);
     repos.forEach(repo => logger.info(repo));
     const stackSize = todoStack.length;
+    let copyBuildId: string | undefined;
     for (const repo of repos) {
       octokit = octokit ?? (await octokitFactory.getShortLivedOctokit());
+      const repoFullName = repo.repo.toString();
       if (
         isCommitHashTooOld(
-          (await configsStore.getConfigs(repo.toString()))?.yaml,
+          (await configsStore.getConfigs(repoFullName))?.yamls,
           commitIndex,
           commitHashes
         )
       ) {
         logger.info(
-          `Ignoring ${repo.toString()} because ${commitHash} is too old.`
+          `Ignoring ${repoFullName} because ${commitHash} is too old.`
         );
-      } else if (!(await copyExists(octokit, repo, commitHash, logger))) {
+      } else if (
+        (copyBuildId = await copyStateStore.findBuildForCopy(
+          repo.repo,
+          copyTagFrom(repo.yamlPath, commitHash)
+        ))
+      ) {
+        logger.info(
+          `Found build ${copyBuildId} for ${commitHash} ` +
+            `for ${repo.repo.owner}:${repo.repo.repo} ${repo.yamlPath}.`
+        );
+      } else {
         const todo: Todo = {repo, commitHash};
         logger.info(`Pushing todo onto stack: ${todo}`);
         todoStack.push(todo);
@@ -130,13 +157,17 @@ export async function scanGoogleapisGenAndCreatePullRequests(
 
   // Copy files beginning with the oldest commit hash.
   for (const todo of todoStack.reverse()) {
-    await copyCodeAndCreatePullRequest(
+    const htmlUrl = await copyCodeAndAppendOrCreatePullRequest(
       sourceDir,
       todo.commitHash,
       todo.repo,
       octokitFactory,
       logger
     );
+    if (copyStateStore) {
+      const copyTag = copyTagFrom(todo.repo.yamlPath, todo.commitHash);
+      copyStateStore.recordBuildForCopy(todo.repo.repo, copyTag, htmlUrl);
+    }
   }
   return todoStack.length;
 }

@@ -17,18 +17,17 @@ import {Probot, createProbot, ProbotOctokit} from 'probot';
 import nock from 'nock';
 import sinon, {SinonStub} from 'sinon';
 import {describe, it, beforeEach, afterEach} from 'mocha';
-import handler from '../src/merge-on-green';
-import {CheckStatus, Reviews, Comment} from '../src/merge-logic';
+import assert from 'assert';
+import {handler} from '../src/merge-on-green';
+import {
+  CheckStatus,
+  Reviews,
+  Comment,
+  getLatestCommit,
+} from '../src/merge-logic';
 import {logger} from 'gcf-utils';
 // eslint-disable-next-line node/no-extraneous-import
-import {config} from '@probot/octokit-plugin-config';
-import {createProbotAuth} from 'octokit-auth-probot';
-
-const TestingOctokit = ProbotOctokit.plugin(config).defaults({
-  authStrategy: createProbotAuth,
-  retry: {enabled: false},
-  throttle: {enabled: false},
-});
+import {Octokit} from '@octokit/rest';
 
 const sandbox = sinon.createSandbox();
 
@@ -49,9 +48,9 @@ function getReviewsCompleted(response: Reviews[]) {
     .reply(200, response);
 }
 
-function getLatestCommit(response: HeadSha[]) {
+function mockLatestCommit(response: HeadSha[]) {
   return nock('https://api.github.com')
-    .get('/repos/testOwner/testRepo/pulls/1/commits?per_page=100&page=1')
+    .get('/repos/testOwner/testRepo/pulls/1/commits')
     .reply(200, response);
 }
 
@@ -153,6 +152,8 @@ function getPR(
 describe('merge-logic', () => {
   let probot: Probot;
   let loggerStub: SinonStub;
+  // TODO(sofisl): Remove once metrics have been collected (06/15/21)
+  let mathRandomStub: SinonStub;
 
   before(() => {
     loggerStub = sandbox.stub(logger, 'error').throwsArg(0);
@@ -166,16 +167,23 @@ describe('merge-logic', () => {
     probot = createProbot({
       overrides: {
         githubToken: 'abc123',
-        Octokit: TestingOctokit,
+        Octokit: ProbotOctokit.defaults({
+          retry: {enabled: false},
+          throttle: {enabled: false},
+        }),
       },
     });
 
     probot.load(handler);
+    // TODO(sofisl): Remove once metrics have been collected (06/15/21)
+    mathRandomStub = sinon.stub(Math, 'random').returns(0.1);
   });
 
   afterEach(() => {
     //loggerStub.restore();
     nock.cleanAll();
+    // TODO(sofisl): Remove once metrics have been collected (06/15/21)
+    mathRandomStub.restore();
   });
 
   handler.removePR = async () => {
@@ -206,7 +214,7 @@ describe('merge-logic', () => {
     it('merges a PR on green', async () => {
       const scopes = [
         getRateLimit(5000),
-        getLatestCommit([{sha: '6dcb09b5b57875f334f61aebed695e2e4193db5e'}]),
+        mockLatestCommit([{sha: '6dcb09b5b57875f334f61aebed695e2e4193db5e'}]),
         getReviewsCompleted([
           {
             user: {login: 'octocat'},
@@ -226,8 +234,15 @@ describe('merge-logic', () => {
       ];
 
       await probot.receive({
-        name: 'schedule.repository' as '*',
-        payload: {org: 'testOwner'},
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        name: 'schedule.installation' as any,
+        payload: {
+          cron_type: 'installation',
+          cron_org: 'testOwner',
+          performMerge: true,
+          installation: {id: 1234},
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        } as any,
         id: 'abc123',
       });
 
@@ -251,7 +266,7 @@ describe('merge-logic', () => {
             id: 12345,
           },
         ]),
-        getLatestCommit([{sha: '6dcb09b5b57875f334f61aebed695e2e4193db5e'}]),
+        mockLatestCommit([{sha: '6dcb09b5b57875f334f61aebed695e2e4193db5e'}]),
         getStatusi('6dcb09b5b57875f334f61aebed695e2e4193db5e', [
           {state: 'success', context: 'Special Check'},
         ]),
@@ -259,8 +274,15 @@ describe('merge-logic', () => {
       ];
 
       await probot.receive({
-        name: 'schedule.repository' as '*',
-        payload: {org: 'testOwner'},
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        name: 'schedule.installation' as any,
+        payload: {
+          cron_type: 'installation',
+          cron_org: 'testOwner',
+          performMerge: true,
+          installation: {id: 1234},
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        } as any,
         id: 'abc123',
       });
 
@@ -278,7 +300,7 @@ describe('merge-logic', () => {
             id: 12345,
           },
         ]),
-        getLatestCommit([]),
+        mockLatestCommit([]),
         getStatusi('', [
           {state: 'success', context: 'Kokoro - Test: Binary Compatibility'},
         ]),
@@ -286,8 +308,15 @@ describe('merge-logic', () => {
       ];
 
       await probot.receive({
-        name: 'schedule.repository' as '*',
-        payload: {org: 'testOwner'},
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        name: 'schedule.installation' as any,
+        payload: {
+          cron_type: 'installation',
+          cron_org: 'testOwner',
+          performMerge: true,
+          installation: {id: 1234},
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        } as any,
         id: 'abc123',
       });
 
@@ -305,7 +334,7 @@ describe('merge-logic', () => {
             id: 12345,
           },
         ]),
-        getLatestCommit([{sha: '6dcb09b5b57875f334f61aebed695e2e4193db5e'}]),
+        mockLatestCommit([{sha: '6dcb09b5b57875f334f61aebed695e2e4193db5e'}]),
         getStatusi('6dcb09b5b57875f334f61aebed695e2e4193db5e', []),
         getRuns('6dcb09b5b57875f334f61aebed695e2e4193db5e', {
           name: '',
@@ -315,8 +344,15 @@ describe('merge-logic', () => {
       ];
 
       await probot.receive({
-        name: 'schedule.repository' as '*',
-        payload: {org: 'testOwner'},
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        name: 'schedule.installation' as any,
+        payload: {
+          cron_type: 'installation',
+          cron_org: 'testOwner',
+          performMerge: true,
+          installation: {id: 1234},
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        } as any,
         id: 'abc123',
       });
 
@@ -334,7 +370,7 @@ describe('merge-logic', () => {
             id: 12345,
           },
         ]),
-        getLatestCommit([{sha: '6dcb09b5b57875f334f61aebed695e2e4193db5e'}]),
+        mockLatestCommit([{sha: '6dcb09b5b57875f334f61aebed695e2e4193db5e'}]),
         getStatusi('6dcb09b5b57875f334f61aebed695e2e4193db5e', [
           {state: 'failure', context: 'Special Check'},
         ]),
@@ -342,8 +378,15 @@ describe('merge-logic', () => {
       ];
 
       await probot.receive({
-        name: 'schedule.repository' as '*',
-        payload: {org: 'testOwner'},
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        name: 'schedule.installation' as any,
+        payload: {
+          cron_type: 'installation',
+          cron_org: 'testOwner',
+          performMerge: true,
+          installation: {id: 1234},
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        } as any,
         id: 'abc123',
       });
 
@@ -361,7 +404,7 @@ describe('merge-logic', () => {
             id: 12345,
           },
         ]),
-        getLatestCommit([{sha: '6dcb09b5b57875f334f61aebed695e2e4193db5e'}]),
+        mockLatestCommit([{sha: '6dcb09b5b57875f334f61aebed695e2e4193db5e'}]),
         getStatusi('6dcb09b5b57875f334f61aebed695e2e4193db5e', []),
         getRuns('6dcb09b5b57875f334f61aebed695e2e4193db5e', {
           name: 'Special Check',
@@ -375,8 +418,15 @@ describe('merge-logic', () => {
       ];
 
       await probot.receive({
-        name: 'schedule.repository' as '*',
-        payload: {org: 'testOwner'},
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        name: 'schedule.installation' as any,
+        payload: {
+          cron_type: 'installation',
+          cron_org: 'testOwner',
+          performMerge: true,
+          installation: {id: 1234},
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        } as any,
         id: 'abc123',
       });
 
@@ -394,7 +444,7 @@ describe('merge-logic', () => {
             id: 12345,
           },
         ]),
-        getLatestCommit([{sha: '6dcb09b5b57875f334f61aebed695e2e4193db5e'}]),
+        mockLatestCommit([{sha: '6dcb09b5b57875f334f61aebed695e2e4193db5e'}]),
         getStatusi('6dcb09b5b57875f334f61aebed695e2e4193db5e', []),
         getRuns('6dcb09b5b57875f334f61aebed695e2e4193db5e', {
           name: 'Special Check',
@@ -405,8 +455,15 @@ describe('merge-logic', () => {
       ];
 
       await probot.receive({
-        name: 'schedule.repository' as '*',
-        payload: {org: 'testOwner'},
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        name: 'schedule.installation' as any,
+        payload: {
+          cron_type: 'installation',
+          cron_org: 'testOwner',
+          performMerge: true,
+          installation: {id: 1234},
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        } as any,
         id: 'abc123',
       });
 
@@ -417,7 +474,7 @@ describe('merge-logic', () => {
       const scopes = [
         getRateLimit(5000),
         getReviewsCompleted([]),
-        getLatestCommit([{sha: '6dcb09b5b57875f334f61aebed695e2e4193db5e'}]),
+        mockLatestCommit([{sha: '6dcb09b5b57875f334f61aebed695e2e4193db5e'}]),
         getStatusi('6dcb09b5b57875f334f61aebed695e2e4193db5e', []),
         getRuns('6dcb09b5b57875f334f61aebed695e2e4193db5e', {
           name: 'Special Check',
@@ -427,8 +484,15 @@ describe('merge-logic', () => {
       ];
 
       await probot.receive({
-        name: 'schedule.repository' as '*',
-        payload: {org: 'testOwner'},
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        name: 'schedule.installation' as any,
+        payload: {
+          cron_type: 'installation',
+          cron_org: 'testOwner',
+          performMerge: true,
+          installation: {id: 1234},
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        } as any,
         id: 'abc123',
       });
 
@@ -441,7 +505,7 @@ describe('merge-logic', () => {
 
       const scopes = [
         getRateLimit(5000),
-        getLatestCommit([{sha: '6dcb09b5b57875f334f61aebed695e2e4193db5e'}]),
+        mockLatestCommit([{sha: '6dcb09b5b57875f334f61aebed695e2e4193db5e'}]),
         getReviewsCompleted([
           {
             user: {login: 'octocat'},
@@ -460,8 +524,15 @@ describe('merge-logic', () => {
       ];
 
       await probot.receive({
-        name: 'schedule.repository' as '*',
-        payload: {org: 'testOwner'},
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        name: 'schedule.installation' as any,
+        payload: {
+          cron_type: 'installation',
+          cron_org: 'testOwner',
+          performMerge: true,
+          installation: {id: 1234},
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        } as any,
         id: 'abc123',
       });
 
@@ -474,7 +545,7 @@ describe('merge-logic', () => {
 
       const scopes = [
         getRateLimit(5000),
-        getLatestCommit([{sha: '6dcb09b5b57875f334f61aebed695e2e4193db5e'}]),
+        mockLatestCommit([{sha: '6dcb09b5b57875f334f61aebed695e2e4193db5e'}]),
         getReviewsCompleted([
           {
             user: {login: 'octocat'},
@@ -493,8 +564,15 @@ describe('merge-logic', () => {
       ];
 
       await probot.receive({
-        name: 'schedule.repository' as '*',
-        payload: {org: 'testOwner'},
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        name: 'schedule.installation' as any,
+        payload: {
+          cron_type: 'installation',
+          cron_org: 'testOwner',
+          performMerge: true,
+          installation: {id: 1234},
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        } as any,
         id: 'abc123',
       });
 
@@ -515,14 +593,13 @@ describe('merge-logic', () => {
             id: 12345,
           },
         ]),
-        getLatestCommit([{sha: '6dcb09b5b57875f334f61aebed695e2e4193db5e'}]),
+        mockLatestCommit([{sha: '6dcb09b5b57875f334f61aebed695e2e4193db5e'}]),
         getStatusi('6dcb09b5b57875f334f61aebed695e2e4193db5e', [
           {state: 'success', context: 'Special Check'},
         ]),
         getCommentsOnPr([
           {
-            body:
-              'Your PR has conflicts that you need to resolve before merge-on-green can automerge',
+            body: 'Your PR has conflicts that you need to resolve before merge-on-green can automerge',
           },
         ]),
         getPR(true, 'dirty', 'open'),
@@ -530,8 +607,15 @@ describe('merge-logic', () => {
       ];
 
       await probot.receive({
-        name: 'schedule.repository' as '*',
-        payload: {org: 'testOwner'},
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        name: 'schedule.installation' as any,
+        payload: {
+          cron_type: 'installation',
+          cron_org: 'testOwner',
+          performMerge: true,
+          installation: {id: 1234},
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        } as any,
         id: 'abc123',
       });
 
@@ -544,8 +628,15 @@ describe('merge-logic', () => {
       const scopes = [getRateLimit(0)];
 
       await probot.receive({
-        name: 'schedule.repository' as '*',
-        payload: {org: 'testOwner'},
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        name: 'schedule.installation' as any,
+        payload: {
+          cron_type: 'installation',
+          cron_org: 'testOwner',
+          performMerge: true,
+          installation: {id: 1234},
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        } as any,
         id: 'abc123',
       });
 
@@ -583,7 +674,7 @@ describe('merge-logic', () => {
             id: 12345,
           },
         ]),
-        getLatestCommit([{sha: '6dcb09b5b57875f334f61aebed695e2e4193db5e'}]),
+        mockLatestCommit([{sha: '6dcb09b5b57875f334f61aebed695e2e4193db5e'}]),
         getStatusi('6dcb09b5b57875f334f61aebed695e2e4193db5e', [
           {state: 'failure', context: 'Special Check'},
         ]),
@@ -594,8 +685,15 @@ describe('merge-logic', () => {
       ];
 
       await probot.receive({
-        name: 'schedule.repository' as '*',
-        payload: {org: 'testOwner'},
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        name: 'schedule.installation' as any,
+        payload: {
+          cron_type: 'installation',
+          cron_org: 'testOwner',
+          performMerge: true,
+          installation: {id: 1234},
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        } as any,
         id: 'abc123',
       });
 
@@ -631,7 +729,7 @@ describe('merge-logic', () => {
             id: 12345,
           },
         ]),
-        getLatestCommit([{sha: '6dcb09b5b57875f334f61aebed695e2e4193db5e'}]),
+        mockLatestCommit([{sha: '6dcb09b5b57875f334f61aebed695e2e4193db5e'}]),
         //Intentionally giving this status check a misleading name. We want subtests to match the beginning
         //of required status checks, not the other way around. i.e., if the required status check is "passes"
         //then it should reject a status check called "passe", but pass one called "passesS"
@@ -646,8 +744,15 @@ describe('merge-logic', () => {
       ];
 
       await probot.receive({
-        name: 'schedule.repository' as '*',
-        payload: {org: 'testOwner'},
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        name: 'schedule.installation' as any,
+        payload: {
+          cron_type: 'installation',
+          cron_org: 'testOwner',
+          performMerge: true,
+          installation: {id: 1234},
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        } as any,
         id: 'abc123',
       });
 
@@ -683,7 +788,7 @@ describe('merge-logic', () => {
             id: 12345,
           },
         ]),
-        getLatestCommit([{sha: '6dcb09b5b57875f334f61aebed695e2e4193db5e'}]),
+        mockLatestCommit([{sha: '6dcb09b5b57875f334f61aebed695e2e4193db5e'}]),
         getStatusi('6dcb09b5b57875f334f61aebed695e2e4193db5e', [
           {
             state: 'success',
@@ -698,8 +803,15 @@ describe('merge-logic', () => {
       ];
 
       await probot.receive({
-        name: 'schedule.repository' as '*',
-        payload: {org: 'testOwner'},
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        name: 'schedule.installation' as any,
+        payload: {
+          cron_type: 'installation',
+          cron_org: 'testOwner',
+          performMerge: true,
+          installation: {id: 1234},
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        } as any,
         id: 'abc123',
       });
 
@@ -735,7 +847,7 @@ describe('merge-logic', () => {
             id: 12345,
           },
         ]),
-        getLatestCommit([{sha: '6dcb09b5b57875f334f61aebed695e2e4193db5e'}]),
+        mockLatestCommit([{sha: '6dcb09b5b57875f334f61aebed695e2e4193db5e'}]),
         getStatusi('6dcb09b5b57875f334f61aebed695e2e4193db5e', [
           {state: 'success', context: 'Special Check'},
         ]),
@@ -747,8 +859,15 @@ describe('merge-logic', () => {
       ];
 
       await probot.receive({
-        name: 'schedule.repository' as '*',
-        payload: {org: 'testOwner'},
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        name: 'schedule.installation' as any,
+        payload: {
+          cron_type: 'installation',
+          cron_org: 'testOwner',
+          performMerge: true,
+          installation: {id: 1234},
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        } as any,
         id: 'abc123',
       });
 
@@ -776,7 +895,7 @@ describe('merge-logic', () => {
 
       const scopes = [
         getRateLimit(5000),
-        getLatestCommit([{sha: '6dcb09b5b57875f334f61aebed695e2e4193db5e'}]),
+        mockLatestCommit([{sha: '6dcb09b5b57875f334f61aebed695e2e4193db5e'}]),
         getReviewsCompleted([
           {
             user: {login: 'octocat'},
@@ -800,12 +919,43 @@ describe('merge-logic', () => {
       ];
 
       await probot.receive({
-        name: 'schedule.repository' as '*',
-        payload: {org: 'testOwner'},
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        name: 'schedule.installation' as any,
+        payload: {
+          cron_type: 'installation',
+          cron_org: 'testOwner',
+          performMerge: true,
+          installation: {id: 1234},
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        } as any,
         id: 'abc123',
       });
 
       scopes.forEach(s => s.done());
+    });
+  });
+
+  describe('gets latest commit', () => {
+    it('gets the latest commit if there were more than 100', async () => {
+      const arrayOfCommits = [];
+      for (let i = 0; i < 102; i++) {
+        if (i === 101) {
+          arrayOfCommits.push({sha: '6dcb09b5blastcommitaebed695e2e4193db5e'});
+        } else {
+          arrayOfCommits.push({
+            sha: '6dcb09b5b57875f334f61aebed695e2e4193db5e',
+          });
+        }
+      }
+      const lastCommitRequest = mockLatestCommit(arrayOfCommits);
+      const lastCommit = await getLatestCommit(
+        'testOwner',
+        'testRepo',
+        1,
+        new Octokit({auth: 'abc123'})
+      );
+      lastCommitRequest.done();
+      assert.match(lastCommit, /lastcommit/);
     });
   });
 });

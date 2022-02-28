@@ -14,12 +14,26 @@
 
 import {describe, it} from 'mocha';
 import * as assert from 'assert';
-import {copyDirs} from '../src/copy-code';
+import {
+  branchNameForCopy,
+  copyCode,
+  copyDirs,
+  copyTagFrom,
+  findCopyTag,
+  findSourceHash,
+  sourceLinkFrom,
+  stat,
+  toSafeBranchName,
+  unpackCopyTag,
+} from '../src/copy-code';
 import path from 'path';
 import * as fs from 'fs';
 import tmp from 'tmp';
 import {OwlBotYaml} from '../src/config-files';
-import {collectDirTree, makeDirTree} from './dir-tree';
+import {collectDirTree, collectGlobResult, makeDirTree} from './dir-tree';
+import {makeAbcRepo, makeRepoWithOwlBotYaml} from './make-repos';
+import {newCmd} from '../src/cmd';
+import glob from 'glob';
 
 describe('copyDirs', () => {
   /**
@@ -28,6 +42,8 @@ describe('copyDirs', () => {
   function makeSourceTree(rootDir: string): string {
     makeDirTree(rootDir, [
       'source',
+      'source/.dot/.gitignore:*.o',
+      'source/.git/123456:x',
       'source/a',
       'source/b',
       'source/a/x',
@@ -65,7 +81,7 @@ describe('copyDirs', () => {
     ]);
   });
 
-  it('copies rootdirectory', () => {
+  it('copies root directory', () => {
     const [sourceDir, destDir] = makeSourceAndDestDirs();
     const yaml: OwlBotYaml = {
       'deep-copy-regex': [
@@ -82,6 +98,24 @@ describe('copyDirs', () => {
       'm/n/r.txt:r',
       'm/n/x',
     ]);
+  });
+
+  it('copies dot files', () => {
+    const [sourceDir, destDir] = makeSourceAndDestDirs();
+    const yaml: OwlBotYaml = {
+      'deep-copy-regex': [
+        {
+          source: '/.dot',
+          dest: '/m/n',
+        },
+      ],
+    };
+    copyDirs(sourceDir, destDir, yaml);
+
+    // Confirm .git/ wasn't copied, but .gitignore was copied.
+    const allFiles = glob.sync('**', {cwd: destDir, dot: true});
+    const tree = collectGlobResult(destDir, allFiles);
+    assert.deepStrictEqual(tree, ['m', 'm/n', 'm/n/.gitignore:*.o']);
   });
 
   it('works for real java tree', () => {
@@ -145,5 +179,212 @@ describe('copyDirs', () => {
       'grpc-google-cloud-asset-v1p1beta1/src/main/java/com/google/cloud/asset/v1p1beta1/AssetServiceGrpc.java:from java import *;',
       'grpc-google-cloud-asset-v1p1beta1/src/maven.xml:I should not be overwritten.',
     ]);
+  });
+
+  it('copies files in order', () => {
+    const tempDir = tmp.dirSync().name;
+    const sourceDir = path.join(tempDir, 'googleapis');
+    // prepare the source
+    makeDirTree(path.join(sourceDir), ['a/x.txt:a', 'b/x.txt:b', 'c/x.txt:c']);
+
+    // Copy a/x.txt last.
+    const destDir = path.join(tempDir, 'destA');
+    copyDirs(sourceDir, destDir, {
+      'deep-copy-regex': [
+        {
+          source: '/.*/(x.txt)',
+          dest: '/$1',
+        },
+        {
+          source: '/a/(x.txt)', // should overwrite earlier copies
+          dest: '/$1',
+        },
+      ],
+    });
+    assert.deepStrictEqual(collectDirTree(destDir), ['x.txt:a']);
+
+    // Copy b/x.txt last.
+    copyDirs(sourceDir, destDir, {
+      'deep-copy-regex': [
+        {
+          source: '/.*/(x.txt)',
+          dest: '/$1',
+        },
+        {
+          source: '/b/(x.txt)', // should overwrite earlier copies
+          dest: '/$1',
+        },
+      ],
+    });
+    assert.deepStrictEqual(collectDirTree(destDir), ['x.txt:b']);
+
+    // Copy c/x.txt last.
+    copyDirs(sourceDir, destDir, {
+      'deep-copy-regex': [
+        {
+          source: '/.*/(x.txt)',
+          dest: '/$1',
+        },
+        {
+          source: '/c/(x.txt)', // should overwrite earlier copies
+          dest: '/$1',
+        },
+      ],
+    });
+    assert.deepStrictEqual(collectDirTree(destDir), ['x.txt:c']);
+  });
+
+  it('removes nested directories', () => {
+    const tempo = tmp.dirSync();
+    const destDir = makeSourceTree(tempo.name);
+    const sourceDir = path.join(tempo.name, 'dest');
+    copyDirs(sourceDir, destDir, {
+      'deep-remove-regex': ['/.*'],
+    });
+    assert.deepStrictEqual(collectDirTree(destDir), []);
+  });
+});
+
+describe('copyCode', function () {
+  // These tests use git locally and read and write a lot to the file system,
+  // so a slow file system will slow them down.
+  this.timeout(60000); // 1 minute.
+  const abcRepo = makeAbcRepo();
+  const cmd = newCmd();
+  const abcCommits = cmd('git log --format=%H', {cwd: abcRepo})
+    .toString('utf8')
+    .split(/\r?\n/)
+    .map(s => s.trim())
+    .filter(s => s);
+
+  beforeEach(() => {
+    cmd('git checkout main', {cwd: abcRepo});
+  });
+
+  const owlBotYaml: OwlBotYaml = {
+    'deep-copy-regex': [
+      {
+        source: '/(.*)',
+        dest: '/src/$1',
+      },
+    ],
+    'deep-remove-regex': ['/src'],
+  };
+
+  it('copies code at a specific commit hash.', async () => {
+    const destRepo = makeRepoWithOwlBotYaml(owlBotYaml);
+    const {sourceCommitHash, commitMsgPath} = await copyCode(
+      abcRepo,
+      abcCommits[1],
+      destRepo,
+      tmp.dirSync().name,
+      owlBotYaml
+    );
+    assert.strictEqual(sourceCommitHash, abcCommits[1]);
+    assert.ok(stat(commitMsgPath)!.size > 0);
+    assert.deepStrictEqual(collectDirTree(destRepo), [
+      '.github',
+      '.github/.OwlBot.yaml:deep-copy-regex:\n' +
+        '  - source: /(.*)\n' +
+        '    dest: /src/$1\n' +
+        'deep-remove-regex:\n' +
+        '  - /src\n',
+      'src',
+      'src/a.txt:1',
+      'src/b.txt:2',
+    ]);
+  });
+
+  it('copies code at most recent commit hash.', async () => {
+    const destRepo = makeRepoWithOwlBotYaml(owlBotYaml);
+    const {sourceCommitHash, commitMsgPath} = await copyCode(
+      abcRepo,
+      '',
+      destRepo,
+      tmp.dirSync().name,
+      owlBotYaml
+    );
+
+    assert.strictEqual(sourceCommitHash, abcCommits[0]);
+    assert.ok(stat(commitMsgPath)!.size > 0);
+    assert.deepStrictEqual(collectDirTree(destRepo), [
+      '.github',
+      '.github/.OwlBot.yaml:deep-copy-regex:\n' +
+        '  - source: /(.*)\n' +
+        '    dest: /src/$1\n' +
+        'deep-remove-regex:\n' +
+        '  - /src\n',
+      'src',
+      'src/a.txt:1',
+      'src/b.txt:2',
+      'src/c.txt:3',
+    ]);
+  });
+});
+
+describe('findSourceHash', () => {
+  it('finds a source hash in a pull request body', () => {
+    const sourceLink = sourceLinkFrom('abc123');
+    assert.strictEqual(findSourceHash(sourceLink), 'abc123');
+    const prBody = `This code is fantastic!\nSource-Link: ${sourceLink}]`;
+    assert.strictEqual(findSourceHash(prBody), 'abc123');
+  });
+
+  it('returns empty string when no source link.', () => {
+    const prBody = 'This code is fantastic!';
+    assert.strictEqual(findSourceHash(prBody), '');
+  });
+});
+
+describe('findCopyTag', () => {
+  it('finds a copy tag in a pull request body', () => {
+    const tag = copyTagFrom('.github/.OwlBot.yaml', 'xyz987');
+    const prBody = `Great code!\nCopy-Tag: ${tag}\nBye.`;
+    const found = findCopyTag(prBody);
+    assert.strictEqual(found, tag);
+  });
+});
+
+describe('unpackCopyTag', () => {
+  it('Correctly unpacks the copy tag.', () => {
+    const tag = copyTagFrom('.github/.OwlBot.yaml', 'xyz987');
+    assert.deepStrictEqual(unpackCopyTag(tag), {
+      p: '.github/.OwlBot.yaml',
+      h: 'xyz987',
+    });
+  });
+
+  it('Throws an exception for an incomplete copy tag.', () => {
+    const tag = Buffer.from(JSON.stringify({h: 'abc123'})).toString('base64');
+    assert.throws(() => {
+      unpackCopyTag(tag);
+    });
+  });
+});
+
+describe('toSafeBranchName', () => {
+  it('correctly replaces characters', () => {
+    assert.strictEqual(toSafeBranchName('a-3!@#$%b^&*()N'), 'a-3_____b_____N');
+  });
+});
+
+describe('branchNameForCopy', () => {
+  it('correctly transforms yaml paths to branch names', () => {
+    assert.strictEqual(
+      branchNameForCopy('/.github/.OwlBot.yaml'),
+      'owl-bot-copy'
+    );
+    assert.strictEqual(
+      branchNameForCopy('.github/.OwlBot.yaml'),
+      'owl-bot-copy'
+    );
+    assert.strictEqual(
+      branchNameForCopy('Firebase/Ad$%min/.OwlBot.yaml'),
+      'owl-bot-copy-Firebase-Ad__min'
+    );
+    assert.strictEqual(
+      branchNameForCopy('/speech/.OwlBot.yaml'),
+      'owl-bot-copy-speech'
+    );
   });
 });

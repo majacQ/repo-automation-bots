@@ -15,38 +15,42 @@
 
 // There are lots of unused args on fake functions, and that's ok.
 /* eslint-disable @typescript-eslint/no-unused-vars */
+/* eslint-disable @typescript-eslint/no-explicit-any */
 
 import * as assert from 'assert';
 import {describe, it, afterEach} from 'mocha';
 
 import {
-  createOnePullRequestForUpdatingLock,
+  triggerOneBuildForUpdatingLock,
   refreshConfigs,
   scanGithubForConfigs,
 } from '../src/handlers';
-import {Configs, ConfigsStore} from '../src/configs-store';
+import {AffectedRepo, Configs, ConfigsStore} from '../src/configs-store';
 import {dump} from 'js-yaml';
-import * as suggester from 'code-suggester';
 import {Octokit} from '@octokit/rest';
 import * as sinon from 'sinon';
 import {OwlBotLock} from '../src/config-files';
-import {
-  core,
-  getAuthenticatedOctokit,
-  getGitHubShortLivedAccessToken,
-} from '../src/core';
+import {core} from '../src/core';
 import {FakeConfigsStore} from './fake-configs-store';
 import {GithubRepo} from '../src/github-repo';
-const sandbox = sinon.createSandbox();
+import {CloudBuildClient} from '@google-cloud/cloudbuild';
+import {newFakeOctokitFactory} from './fake-octokit';
+import {newFakeCloudBuildClient} from './fake-cloud-build-client';
+import AdmZip from 'adm-zip';
+import tmp from 'tmp';
+import * as fs from 'fs';
+import path from 'path';
+import {newCmd} from '../src/cmd';
+import * as fc from '../src/fetch-configs';
 
-type Changes = Array<[string, {content: string; mode: string}]>;
+const sandbox = sinon.createSandbox();
 
 describe('handlers', () => {
   afterEach(() => {
     sandbox.restore();
   });
-  describe('createOnePullRequestForUpdatingLock', () => {
-    it('updates .github/.OwlBot.lock.yaml if no pull request found', async () => {
+  describe('triggerOneBuildForUpdatingLock', () => {
+    it('creates a cloud build if no existing build id found', async () => {
       const lock = {
         docker: {
           image: 'foo-image',
@@ -54,12 +58,12 @@ describe('handlers', () => {
         },
       };
       const expectedYaml = dump(lock);
-      let recordedURI = '';
+      let recordedId = '';
       // Mock the database helpers used to check for/update existing PRs:
       class FakeConfigStore implements ConfigsStore {
         findReposAffectedByFileChanges(
           changedFilePaths: string[]
-        ): Promise<GithubRepo[]> {
+        ): Promise<AffectedRepo[]> {
           throw new Error('Method not implemented.');
         }
         // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -82,7 +86,7 @@ describe('handlers', () => {
         ): Promise<[string, Configs][]> {
           throw new Error('Method not implemented.');
         }
-        findPullRequestForUpdatingLock(
+        findBuildIdForUpdatingLock(
           // eslint-disable-next-line @typescript-eslint/no-unused-vars
           repo: string,
           // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -90,43 +94,60 @@ describe('handlers', () => {
         ): Promise<string | undefined> {
           return Promise.resolve(undefined);
         }
-        recordPullRequestForUpdatingLock(
+        recordBuildIdForUpdatingLock(
           // eslint-disable-next-line @typescript-eslint/no-unused-vars
           repo: string,
           // eslint-disable-next-line @typescript-eslint/no-unused-vars
           lock: OwlBotLock,
-          pullRequestId: string
+          buildId: string
         ): Promise<string> {
-          recordedURI = pullRequestId;
-          return Promise.resolve(recordedURI);
+          recordedId = buildId;
+          return Promise.resolve(recordedId);
+        }
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
+        clearConfigs(repo: string): Promise<void> {
+          throw new Error('Method not implemented.');
         }
       }
       const fakeConfigStore = new FakeConfigStore();
       // Mock the method from code-suggester that opens the upstream
       // PR on GitHub:
-      let expectedChanges: Changes = [];
-      sandbox.replace(
-        suggester,
-        'createPullRequest',
-        (_octokit, changes): Promise<number> => {
-          if (changes) {
-            expectedChanges = [...((changes as unknown) as Changes)];
-          }
-          return Promise.resolve(22);
-        }
-      );
+      const fakeCloudBuild = newFakeCloudBuildClient();
+      const calls = fakeCloudBuild.calls;
+      sandbox.replace(core, 'getCloudBuildInstance', (): CloudBuildClient => {
+        return fakeCloudBuild;
+      });
 
-      const expectedURI = await createOnePullRequestForUpdatingLock(
+      const expectedBuildId = await triggerOneBuildForUpdatingLock(
         fakeConfigStore,
-        new Octokit(), // Not actually used.
         'owl/test',
-        lock
+        lock,
+        'test-project',
+        'test-trigger'
       );
-      assert.strictEqual(expectedURI, 'https://github.com/owl/test/pull/22');
-      assert.strictEqual(recordedURI, 'https://github.com/owl/test/pull/22');
-      assert.strictEqual(expectedChanges[0][1].content, expectedYaml);
+      assert.strictEqual(expectedBuildId, '73');
+      assert.strictEqual(recordedId, '73');
+      assert.deepStrictEqual(calls, [
+        [
+          {
+            projectId: 'test-project',
+            source: {
+              projectId: 'test-project',
+              substitutions: {
+                _CONTAINER: 'foo-image@sha256:abc123',
+                _LOCK_FILE_PATH: '.github/.OwlBot.lock.yaml',
+                _OWL_BOT_CLI: 'gcr.io/repo-automation-bots/owlbot-cli',
+                _PR_BRANCH: 'owl-bot-update-lock-abc123',
+                _PR_OWNER: 'owl',
+                _REPOSITORY: 'test',
+              },
+            },
+            triggerId: 'test-trigger',
+          },
+        ],
+      ]);
     });
-    it('returns existing pull request URI, if PR has already been created', async () => {
+    it('returns existing build Id, if build has already been triggered', async () => {
       const lock = {
         docker: {
           image: 'foo-image',
@@ -137,7 +158,7 @@ describe('handlers', () => {
       class FakeConfigStore implements ConfigsStore {
         findReposAffectedByFileChanges(
           changedFilePaths: string[]
-        ): Promise<GithubRepo[]> {
+        ): Promise<AffectedRepo[]> {
           throw new Error('Method not implemented.');
         }
         // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -160,7 +181,7 @@ describe('handlers', () => {
         ): Promise<[string, Configs][]> {
           throw new Error('Method not implemented.');
         }
-        findPullRequestForUpdatingLock(
+        findBuildIdForUpdatingLock(
           // eslint-disable-next-line @typescript-eslint/no-unused-vars
           repo: string,
           // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -168,62 +189,121 @@ describe('handlers', () => {
         ): Promise<string | undefined> {
           return Promise.resolve('https://github.com/owl/test/pull/99');
         }
-        recordPullRequestForUpdatingLock(
+        recordBuildIdForUpdatingLock(
           // eslint-disable-next-line @typescript-eslint/no-unused-vars
           repo: string,
           // eslint-disable-next-line @typescript-eslint/no-unused-vars
           lock: OwlBotLock,
           // eslint-disable-next-line @typescript-eslint/no-unused-vars
-          pullRequestId: string
+          BuildIdId: string
         ): Promise<string> {
+          throw new Error('Method not implemented.');
+        }
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
+        clearConfigs(repo: string): Promise<void> {
           throw new Error('Method not implemented.');
         }
       }
       const fakeConfigStore = new FakeConfigStore();
-      const expectedURI = await createOnePullRequestForUpdatingLock(
+      const expectedURI = await triggerOneBuildForUpdatingLock(
         fakeConfigStore,
-        new Octokit(), // Not actually used.
         'owl/test',
-        lock
+        lock,
+        'test-project',
+        'test-trigger'
       );
       assert.strictEqual(expectedURI, 'https://github.com/owl/test/pull/99');
     });
   });
 });
 
+function repoFromZip(repoName: string, zip: AdmZip): GithubRepo {
+  const tmpDir = tmp.dirSync().name;
+  zip.extractAllTo(tmpDir);
+  // The root directory of the zip is <repo-name>-<short-hash>.
+  // That's actually the directory we want to work in.
+  const [rootDir] = fs.readdirSync(tmpDir);
+  const repoDir = rootDir ? path.join(tmpDir, rootDir) : tmpDir;
+  const cmd = newCmd();
+  cmd('git init -b main', {cwd: repoDir});
+  cmd('git config user.email "test@example.com"', {cwd: repoDir});
+  cmd('git config user.name "test"', {cwd: repoDir});
+  cmd('git add -A', {cwd: repoDir});
+  cmd('git commit --allow-empty -m "files"', {cwd: repoDir});
+  cmd('git checkout -b 123', {cwd: repoDir});
+  return {
+    getCloneUrl: () => repoDir,
+    owner: 'googleapis',
+    repo: repoName,
+    toString: () => `googleapis/${repoName}`,
+  };
+}
+
+function zipWithOwlBotYaml(): AdmZip {
+  const zip = new AdmZip();
+  zip.addZipComment('This is a test.');
+  zip.addFile(
+    'repo-abc123/.github/.OwlBot.yaml',
+    Buffer.from(
+      `
+    docker:
+      image: gcr.io/repo-automation-bots/nodejs-post-processor:latest
+  `,
+      'utf8'
+    )
+  );
+  return zip;
+}
+
 describe('refreshConfigs', () => {
   afterEach(() => {
     sandbox.restore();
   });
 
-  const octokitSha123 = ({
-    repos: {
-      getBranch() {
-        return {
-          data: {
-            commit: {
-              sha: '123',
-            },
-          },
-        };
+  const octokitSha123 = (zip?: AdmZip): InstanceType<typeof Octokit> => {
+    return {
+      issues: {
+        create: () => {
+          return {data: {html_url: 'h:/x/y'}};
+        },
+        listForRepo: () => {
+          return {data: []};
+        },
       },
-    },
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  } as any) as InstanceType<typeof Octokit>;
+      repos: {
+        getBranch() {
+          return {
+            data: {
+              commit: {
+                sha: '123',
+              },
+            },
+          };
+        },
+        downloadZipballArchive() {
+          if (!zip) {
+            zip = new AdmZip();
+            zip.addZipComment('This is a test.');
+            zip.addFile(
+              'repo-123/README.txt',
+              Buffer.from('This is a very useful API.')
+            );
+          }
+          return {data: zip.toBuffer()};
+        },
+      },
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any as InstanceType<typeof Octokit>;
+  };
 
   it('stores a good yaml', async () => {
     const configsStore = new FakeConfigsStore();
-    sandbox.stub(core, 'getFileContent').resolves(`
-      docker:
-        image: gcr.io/repo-automation-bots/nodejs-post-processor:latest
-    `);
 
     await refreshConfigs(
       configsStore,
       undefined,
-      octokitSha123,
-      'googleapis',
-      'nodejs-vision',
+      octokitSha123(zipWithOwlBotYaml()),
+      repoFromZip('nodejs-vision', zipWithOwlBotYaml()),
       'main',
       42
     );
@@ -237,12 +317,17 @@ describe('refreshConfigs', () => {
             branchName: 'main',
             commitHash: '123',
             installationId: 42,
-            yaml: {
-              docker: {
-                image:
-                  'gcr.io/repo-automation-bots/nodejs-post-processor:latest',
+            yamls: [
+              {
+                path: '.github/.OwlBot.yaml',
+                yaml: {
+                  docker: {
+                    image:
+                      'gcr.io/repo-automation-bots/nodejs-post-processor:latest',
+                  },
+                },
               },
-            },
+            ],
           },
         ],
       ])
@@ -251,18 +336,24 @@ describe('refreshConfigs', () => {
 
   it('stores a good lock.yaml', async () => {
     const configsStore = new FakeConfigsStore();
-    sandbox.stub(core, 'getFileContent').resolves(`
+    const zip = new AdmZip();
+    zip.addFile(
+      'repo-abc123/.github/.OwlBot.lock.yaml',
+      Buffer.from(
+        `
       docker:
         image: gcr.io/repo-automation-bots/nodejs-post-processor:latest
         digest: sha256:abcdef
-    `);
+    `,
+        'utf8'
+      )
+    );
 
     await refreshConfigs(
       configsStore,
       undefined,
-      octokitSha123,
-      'googleapis',
-      'nodejs-vision',
+      octokitSha123(zip),
+      repoFromZip('nodejs-vision', zip),
       'main',
       42
     );
@@ -296,9 +387,8 @@ describe('refreshConfigs', () => {
     await refreshConfigs(
       configsStore,
       undefined,
-      octokitSha123,
-      'googleapis',
-      'nodejs-vision',
+      octokitSha123(),
+      repoFromZip('nodejs-vision', new AdmZip()),
       'main',
       42
     );
@@ -336,9 +426,8 @@ describe('refreshConfigs', () => {
     await refreshConfigs(
       configsStore,
       undefined,
-      octokitSha123,
-      'googleapis',
-      'nodejs-vision',
+      octokitSha123(),
+      repoFromZip('nodejs-vision', new AdmZip()),
       'main',
       77
     );
@@ -370,14 +459,79 @@ describe('refreshConfigs', () => {
     await refreshConfigs(
       configsStore,
       configs,
-      octokitSha123,
-      'googleapis',
-      'nodejs-vision',
+      octokitSha123(),
+      repoFromZip('nodejs-vision', new AdmZip()),
       'main',
       77
     );
 
     assert.deepStrictEqual(configsStore.configs, new Map());
+  });
+
+  it('creates issues when configs cannot be loaded', async () => {
+    const configsStore = new FakeConfigsStore();
+    const universalInvalidContent = 'deep-copy-regex\n - invalid_prop: 1';
+
+    const zip = new AdmZip();
+    zip.addFile(
+      'repo-abc123/.github/.OwlBot.yaml',
+      Buffer.from(universalInvalidContent)
+    );
+    zip.addFile(
+      'repo-abc123/.github/.OwlBot.lock.yaml',
+      Buffer.from(universalInvalidContent)
+    );
+
+    const octokit = octokitSha123(zip);
+    const issuesCreateSpy = sandbox.spy(octokit.issues, 'create');
+
+    await refreshConfigs(
+      configsStore,
+      undefined,
+      octokit,
+      repoFromZip('nodejs-vision', zip),
+      'main',
+      42
+    );
+
+    assert.strictEqual(issuesCreateSpy.callCount, 2);
+  });
+
+  it('creates issues with nice messages when there are validation errors', async () => {
+    const configsStore = new FakeConfigsStore();
+    const invalidConfig =
+      'deep-copy-regex:\n - source: /(*foo)\n   dest: missing/leading/slash';
+
+    const zip = new AdmZip();
+    zip.addFile('repo-abc123/.github/.OwlBot.yaml', Buffer.from(invalidConfig));
+
+    const octokit = octokitSha123(zip);
+    const issuesCreateSpy = sandbox.spy(octokit.issues, 'create');
+
+    await refreshConfigs(
+      configsStore,
+      undefined,
+      octokit,
+      repoFromZip('nodejs-vision', zip),
+      'main',
+      42
+    );
+
+    assert.strictEqual(issuesCreateSpy.callCount, 1);
+    sinon.assert.calledOnceWithExactly(
+      issuesCreateSpy,
+      sinon.match.has(
+        'body',
+        sinon.match(new RegExp('expected the first character of dest'))
+      )
+    );
+    sinon.assert.calledOnceWithExactly(
+      issuesCreateSpy,
+      sinon.match.has(
+        'body',
+        sinon.match(new RegExp('SyntaxError: Invalid regular expression'))
+      )
+    );
   });
 });
 
@@ -386,7 +540,7 @@ describe('scanGithubForConfigs', () => {
     sandbox.restore();
   });
 
-  const octokitWithRepos = ({
+  const octokitWithRepos = {
     repos: {
       getBranch() {
         return {
@@ -403,6 +557,10 @@ describe('scanGithubForConfigs', () => {
             return 'merge';
           },
         },
+      },
+      downloadZipballArchive() {
+        const zip = zipWithOwlBotYaml();
+        return {data: zip.toBuffer()};
       },
     },
     paginate: {
@@ -425,9 +583,9 @@ describe('scanGithubForConfigs', () => {
       },
     },
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  } as any) as InstanceType<typeof Octokit>;
+  } as any as InstanceType<typeof Octokit>;
 
-  const octokitWith404OnBranch = ({
+  const octokitWith404OnBranch = {
     repos: {
       getBranch() {
         throw Object.assign(Error('Not Found'), {status: 404});
@@ -453,19 +611,35 @@ describe('scanGithubForConfigs', () => {
       },
     },
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  } as any) as InstanceType<typeof Octokit>;
+  } as any as InstanceType<typeof Octokit>;
+
+  const octokitFactoryWith404OnBranch = newFakeOctokitFactory(
+    octokitWith404OnBranch
+  );
+  const octokitFactoryWithRepos = newFakeOctokitFactory(octokitWithRepos);
 
   it('works with an installationId', async () => {
     const configsStore = new FakeConfigsStore();
-    sandbox.stub(core, 'getFileContent').resolves(`
-      docker:
-        image: gcr.io/repo-automation-bots/nodejs-post-processor:latest
-    `);
+    sandbox.stub(fc, 'fetchConfigs').resolves({
+      badConfigs: [],
+      yamls: [
+        {
+          path: '.github/.OwlBot.yaml',
+          yaml: {
+            docker: {
+              image: 'gcr.io/repo-automation-bots/nodejs-post-processor:latest',
+            },
+          },
+        },
+      ],
+    });
+
     await scanGithubForConfigs(
       configsStore,
-      octokitWithRepos,
+      octokitFactoryWithRepos,
       'googleapis',
-      45
+      45,
+      []
     );
 
     assert.deepStrictEqual(
@@ -477,12 +651,17 @@ describe('scanGithubForConfigs', () => {
             branchName: 'master',
             commitHash: '123',
             installationId: 45,
-            yaml: {
-              docker: {
-                image:
-                  'gcr.io/repo-automation-bots/nodejs-post-processor:latest',
+            yamls: [
+              {
+                path: '.github/.OwlBot.yaml',
+                yaml: {
+                  docker: {
+                    image:
+                      'gcr.io/repo-automation-bots/nodejs-post-processor:latest',
+                  },
+                },
               },
-            },
+            ],
           },
         ],
         [
@@ -491,12 +670,17 @@ describe('scanGithubForConfigs', () => {
             branchName: 'main',
             commitHash: '123',
             installationId: 45,
-            yaml: {
-              docker: {
-                image:
-                  'gcr.io/repo-automation-bots/nodejs-post-processor:latest',
+            yamls: [
+              {
+                path: '.github/.OwlBot.yaml',
+                yaml: {
+                  docker: {
+                    image:
+                      'gcr.io/repo-automation-bots/nodejs-post-processor:latest',
+                  },
+                },
               },
-            },
+            ],
           },
         ],
         [
@@ -505,12 +689,17 @@ describe('scanGithubForConfigs', () => {
             branchName: 'master',
             commitHash: '123',
             installationId: 45,
-            yaml: {
-              docker: {
-                image:
-                  'gcr.io/repo-automation-bots/nodejs-post-processor:latest',
+            yamls: [
+              {
+                path: '.github/.OwlBot.yaml',
+                yaml: {
+                  docker: {
+                    image:
+                      'gcr.io/repo-automation-bots/nodejs-post-processor:latest',
+                  },
+                },
               },
-            },
+            ],
           },
         ],
       ])
@@ -525,9 +714,10 @@ describe('scanGithubForConfigs', () => {
     `);
     await scanGithubForConfigs(
       configsStore,
-      octokitWith404OnBranch,
+      octokitFactoryWith404OnBranch,
       'googleapis',
-      45
+      45,
+      []
     );
   });
 });

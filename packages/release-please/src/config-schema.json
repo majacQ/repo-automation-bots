@@ -1,0 +1,188 @@
+{
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "title": "release-please config",
+    "description": "Schema for defining the release-please config",
+    "additionalProperties": false,
+    "type": "object",
+    "definitions": {
+        "BranchOptions": {
+            "type": "object",
+            "properties": {
+                "releaseLabels": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "monorepoTags": {
+                    "type": "boolean"
+                },
+                "releaseType": {
+                    "enum": [
+                        "dart",
+                        "elixir",
+                        "go",
+                        "go-yoshi",
+                        "helm",
+                        "java-bom",
+                        "java-lts",
+                        "java-backport",
+                        "java-yoshi",
+                        "krm-blueprint",
+                        "node",
+                        "ocaml",
+                        "php",
+                        "php-yoshi",
+                        "python",
+                        "ruby",
+                        "ruby-yoshi",
+                        "rust",
+                        "simple",
+                        "terraform-module"
+                    ]
+                },
+                "versioning": {
+                    "enum": [
+                        "default",
+                        "always-bump-patch",
+                        "service-pack"
+                    ]
+                },
+                "changelogType": {
+                    "enum": [
+                        "default",
+                        "github"
+                    ]
+                },
+                "packageName": {
+                    "type": "string"
+                },
+                "handleGHRelease": {
+                    "type": "boolean"
+                },
+                "bumpMinorPreMajor": {
+                    "type": "boolean"
+                },
+                "bumpPatchForMinorPreMajor": {
+                    "type": "boolean"
+                },
+                "path": {
+                    "type": "string"
+                },
+                "changelogPath": {
+                    "type": "string"
+                },
+                "manifest": {
+                    "type": "boolean"
+                },
+                "manifestFile": {
+                    "type": "string"
+                },
+                "manifestConfig": {
+                    "type": "string"
+                },
+                "extraFiles": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "releaseLabel": {
+                    "type": "string"
+                },
+                "draft": {
+                    "type": "boolean"
+                },
+                "draftPullRequest": {
+                    "type": "boolean"
+                },
+                "pullRequestTitlePattern": {
+                    "type": "string"
+                },
+                "versionFile": {
+                    "type": "string"
+                }
+            }
+        }
+    },
+    "properties": {
+        "primaryBranch": true,
+        "branches": true,
+        "releaseLabels": true,
+        "monorepoTags": true,
+        "releaseType": true,
+        "packageName": true,
+        "handleGHRelease": true,
+        "bumpMinorPreMajor": true,
+        "bumpPatchForMinorPreMajor": true,
+        "path": true,
+        "changelogPath": true,
+        "manifest": true,
+        "manifestFile": true,
+        "manifestConfig": true,
+        "extraFiles": true,
+        "releaseLabel": true,
+        "draft": true,
+        "draftPullRequest": true,
+        "pullRequestTitlePattern": true,
+        "versionFile": true,
+        "disableFailureChecker": true,
+        "versioning": true,
+        "changelogType": true
+    },
+    "allOf": [
+        { "$ref": "#/definitions/BranchOptions"},
+        {
+            "properties": {
+                "primaryBranch": {
+                    "type": "string"
+                },
+                "disableFailureChecker": {
+                    "type": "boolean"
+                },
+                "branches": {
+                    "type": "array",
+                    "items": {
+                        "additionalProperties": false,
+                        "required": ["branch"],
+                        "properties": {
+                            "branch": true,
+                            "releaseLabels": true,
+                            "monorepoTags": true,
+                            "releaseType": true,
+                            "packageName": true,
+                            "handleGHRelease": true,
+                            "bumpMinorPreMajor": true,
+                            "bumpPatchForMinorPreMajor": true,
+                            "path": true,
+                            "changelogPath": true,
+                            "manifest": true,
+                            "manifestFile": true,
+                            "manifestConfig": true,
+                            "extraFiles": true,
+                            "releaseLabel": true,
+                            "draft": true,
+                            "draftPullRequest": true,
+                            "pullRequestTitlePattern": true,
+                            "versionFile": true,
+                            "disableFailureChecker": true,
+                            "versioning": true,
+                            "changelogType": true
+                        },
+                        "allOf": [
+                            { "$ref": "#/definitions/BranchOptions"},
+                            {
+                                "properties": {
+                                    "branch": {
+                                        "type": "string"
+                                    }
+                                }
+                            }
+                        ]
+
+                    }
+                }
+            }
+        }
+    ]
+}

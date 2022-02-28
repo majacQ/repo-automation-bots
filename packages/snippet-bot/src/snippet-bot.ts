@@ -16,21 +16,25 @@
 /* eslint-disable node/no-extraneous-import */
 
 import {Probot, Context} from 'probot';
-import {EventPayloads} from '@octokit/webhooks';
-
+import {PullRequest} from '@octokit/webhooks-definitions/schema';
+import {RequestError} from '@octokit/types';
 import {Configuration, ConfigurationOptions} from './configuration';
 import {DEFAULT_CONFIGURATION, CONFIGURATION_FILE_PATH} from './configuration';
+import {REFRESH_LABEL, NO_PREFIX_REQ_LABEL, SNIPPET_BOT_LABELS} from './labels';
 import {
   parseRegionTags,
   parseRegionTagsInPullRequest,
   ParseResult,
 } from './region-tag-parser';
 import {
+  Conclusion,
+  CheckAggregator,
   formatBody,
   formatExpandable,
   formatRegionTag,
   formatViolations,
   formatMatchingViolation,
+  isFile,
 } from './utils';
 import {invalidateCache} from './snippets';
 import {
@@ -38,7 +42,10 @@ import {
   checkProductPrefixViolations,
   checkRemovingUsedTagViolations,
 } from './violations';
+import schema from './config-schema.json';
 
+import {ConfigChecker, getConfig} from '@google-automations/bot-config-utils';
+import {syncLabels} from '@google-automations/label-utils';
 import {logger, addOrUpdateIssueComment} from 'gcf-utils';
 import fetch from 'node-fetch';
 import tmp from 'tmp-promise';
@@ -50,34 +57,18 @@ import path from 'path';
 
 const streamPipeline = util.promisify(require('stream').pipeline);
 
-type Conclusion =
-  | 'success'
-  | 'failure'
-  | 'neutral'
-  | 'cancelled'
-  | 'timed_out'
-  | 'action_required'
-  | undefined;
-
 // Solely for avoid using `any` type.
 interface Label {
   name: string;
 }
 
-interface File {
-  content: string | undefined;
-}
-
-function isFile(file: File | unknown): file is File {
-  return (file as File).content !== undefined;
-}
-
 const FULL_SCAN_ISSUE_TITLE = 'snippet-bot full scan';
-
-const REFRESH_LABEL = 'snippet-bot:force-run';
 
 const REFRESH_UI = '- [ ] Refresh this comment';
 const REFRESH_STRING = '- [x] Refresh this comment';
+
+// Github issue comment API has a limit of 65536 characters.
+const MAX_CHARS_IN_COMMENT = 64000;
 
 async function downloadFile(url: string, file: string) {
   const response = await fetch(url);
@@ -102,23 +93,11 @@ async function getFiles(dir: string, allFiles: string[]) {
   return allFiles;
 }
 
-async function getConfigOptions(
-  context: Context
-): Promise<ConfigurationOptions | null> {
-  let configOptions: ConfigurationOptions | null = null;
-  try {
-    configOptions = await context.config<ConfigurationOptions>(
-      CONFIGURATION_FILE_PATH
-    );
-  } catch (err) {
-    err.message = `Error reading configuration: ${err.message}`;
-    logger.error(err);
-  }
-  return configOptions;
-}
-
-async function fullScan(context: Context, configuration: Configuration) {
-  const installationId = context.payload.installation.id;
+async function fullScan(
+  context: Context<'issues'>,
+  configuration: Configuration
+) {
+  const installationId = context.payload.installation?.id;
   const commentMark = `<!-- probot comment [${installationId}]-->`;
   const owner = context.payload.repository.owner.login;
   const repo = context.payload.repository.name;
@@ -189,7 +168,8 @@ async function fullScan(context: Context, configuration: Configuration) {
             failureMessages.push(`- [ ] ${formatted}`);
           }
         }
-      } catch (err) {
+      } catch (e) {
+        const err = e as Error;
         err.message = `Failed to read the file: ${err.message}`;
         logger.error(err);
         continue;
@@ -204,7 +184,7 @@ async function fullScan(context: Context, configuration: Configuration) {
       repo: repo,
       issue_number: issueNumber,
       body: formatBody(
-        context.payload.issue.body,
+        context.payload.issue.body as string,
         commentMark,
         `## snippet-bot scan result
 Life is too short to manually check unmatched region tags.
@@ -212,7 +192,8 @@ Here is the result:
 ${bodyDetail}`
       ),
     });
-  } catch (err) {
+  } catch (e) {
+    const err = e as Error;
     err.message = `Failed to scan files: ${err.message}`;
     logger.error(err);
     await context.octokit.issues.update({
@@ -220,7 +201,7 @@ ${bodyDetail}`
       repo: repo,
       issue_number: issueNumber,
       body: formatBody(
-        context.payload.issue.body,
+        context.payload.issue.body as string,
         commentMark,
         `## snippet-bot scan result\nFailed running the full scan: ${err}.`
       ),
@@ -232,17 +213,24 @@ ${bodyDetail}`
 }
 
 async function scanPullRequest(
-  context: Context,
-  pull_request: EventPayloads.WebhookPayloadPullRequestPullRequest,
+  context: Context<'pull_request'> | Context<'issue_comment'>,
+  pull_request: PullRequest,
   configuration: Configuration,
   refreshing = false
 ) {
-  const installationId = context.payload.installation.id;
+  const installationId = context.payload.installation?.id;
   const owner = context.payload.repository.owner.login;
   const repo = context.payload.repository.name;
 
+  const aggregator = new CheckAggregator(
+    context.octokit,
+    'snippet-bot check',
+    configuration.aggregateChecks()
+  );
+
   // Parse the PR diff and recognize added/deleted region tags.
   const result = await parseRegionTagsInPullRequest(
+    context.octokit,
     pull_request.diff_url,
     pull_request.base.repo.owner.login,
     pull_request.base.repo.name,
@@ -255,6 +243,11 @@ async function scanPullRequest(
   let mismatchedTags = false;
   let tagsFound = false;
   const failureMessages: string[] = [];
+
+  // Whether to ignore prefix requirement.
+  const noPrefixReq = pull_request.labels.some((label: Label) => {
+    return label.name === NO_PREFIX_REQ_LABEL;
+  });
 
   // Keep track of start tags in all the files.
   const parseResults = new Map<string, ParseResult>();
@@ -295,7 +288,8 @@ async function scanPullRequest(
       if (parseResult.tagsFound) {
         tagsFound = true;
       }
-    } catch (err) {
+    } catch (e) {
+      const err = e as RequestError & Error;
       // Ignoring 403/404 errors.
       if (err.status === 403 || err.status === 404) {
         logger.info(
@@ -329,14 +323,27 @@ async function scanPullRequest(
 
   // post the status of commit linting to the PR, using:
   // https://developer.github.com/v3/checks/
-  if (tagsFound) {
-    await context.octokit.checks.create(checkParams);
+  if (
+    configuration.alwaysCreateStatusCheck() ||
+    configuration.aggregateChecks() ||
+    tagsFound
+  ) {
+    await aggregator.add(checkParams);
   }
 
   let commentBody = '';
 
   if (result.changes.length === 0) {
-    if (!refreshing) {
+    // If this run is initiated by a user with the force-run label
+    // or refresh checkbox, we don't exit.
+    //
+    // Also, the config `alwaysCreateStatusCheck` is true, we need
+    // to create successfull status checks, so we don't exit.
+    if (
+      !refreshing &&
+      !configuration.alwaysCreateStatusCheck() &&
+      !configuration.aggregateChecks()
+    ) {
       return;
     }
     commentBody += 'No region tags are edited in this PR.\n';
@@ -346,10 +353,13 @@ async function scanPullRequest(
   const prNumber = pull_request.number;
 
   // First check product prefix for added region tags.
-  const productPrefixViolations = await checkProductPrefixViolations(
-    result,
-    configuration
-  );
+  let productPrefixViolations: Array<Violation> = [];
+  if (!noPrefixReq) {
+    productPrefixViolations = await checkProductPrefixViolations(
+      result,
+      configuration
+    );
+  }
   const removingUsedTagsViolations = await checkRemovingUsedTagViolations(
     result,
     configuration,
@@ -357,12 +367,12 @@ async function scanPullRequest(
     pull_request.base.repo.full_name,
     pull_request.base.ref
   );
-  const removeUsedTagViolations = removingUsedTagsViolations.get(
-    'REMOVE_USED_TAG'
-  ) as Violation[];
-  const removeConflictingTagViolations = removingUsedTagsViolations.get(
-    'REMOVE_CONFLICTING_TAG'
-  ) as Violation[];
+  const removeUsedTagViolations = [
+    ...(removingUsedTagsViolations.get('REMOVE_USED_TAG') as Violation[]),
+    ...(removingUsedTagsViolations.get(
+      'REMOVE_CONFLICTING_TAG'
+    ) as Violation[]),
+  ];
   const removeSampleBrowserViolations = removingUsedTagsViolations.get(
     'REMOVE_SAMPLE_BROWSER_PAGE'
   ) as Violation[];
@@ -370,10 +380,33 @@ async function scanPullRequest(
     'REMOVE_FROZEN_REGION_TAG'
   ) as Violation[];
 
+  // status check for productPrefixViolations
+  const prefixCheckParams = context.repo({
+    name: 'Region tag product prefix',
+    conclusion: 'success' as Conclusion,
+    head_sha: pull_request.head.sha,
+    output: {
+      title: 'No violations',
+      summary: 'No violations found',
+      text: 'All the tags have appropriate product prefix',
+    },
+  });
+
+  // status check for removeUsedTagViolations
+  const removeUsedTagCheckParams = context.repo({
+    name: 'Disruptive region tag removal',
+    conclusion: 'success' as Conclusion,
+    head_sha: pull_request.head.sha,
+    output: {
+      title: 'No violations',
+      summary: 'No violations found',
+      text: 'No disruptive region tag removal',
+    },
+  });
+
   if (
     productPrefixViolations.length > 0 ||
-    removeUsedTagViolations.length > 0 ||
-    removeConflictingTagViolations.length > 0
+    removeUsedTagViolations.length > 0
   ) {
     commentBody += 'Here is the summary of possible violations 😱';
 
@@ -386,7 +419,17 @@ async function scanPullRequest(
       } else {
         summary = `There are ${productPrefixViolations.length} possible violations for not having product prefix.`;
       }
-      commentBody += formatViolations(productPrefixViolations, summary);
+      const productPrefixViolationsDetail = formatViolations(
+        productPrefixViolations,
+        summary
+      );
+      commentBody += productPrefixViolationsDetail;
+      prefixCheckParams.conclusion = 'failure';
+      prefixCheckParams.output = {
+        title: 'Missing region tag prefix',
+        summary: 'Some region tags do not have appropriate prefix',
+        text: productPrefixViolationsDetail,
+      };
     }
 
     // Rendering used tag violations
@@ -399,19 +442,19 @@ async function scanPullRequest(
         summary = `There are ${removeUsedTagViolations.length} possible violations for removing region tag in use.`;
       }
 
-      commentBody += formatViolations(removeUsedTagViolations, summary);
+      const removeUsedTagViolationsDetail = formatViolations(
+        removeUsedTagViolations,
+        summary
+      );
+      commentBody += removeUsedTagViolationsDetail;
+      removeUsedTagCheckParams.conclusion = 'failure';
+      removeUsedTagCheckParams.output = {
+        title: 'Removal of region tags in use',
+        summary: '',
+        text: removeUsedTagViolationsDetail,
+      };
     }
 
-    if (removeConflictingTagViolations.length > 0) {
-      let summary = '';
-      if (removeConflictingTagViolations.length === 1) {
-        summary =
-          'There is a possible violation for removing conflicting region tag in use.';
-      } else {
-        summary = `There are ${removeConflictingTagViolations.length} possible violations for removing conflicting region tag in use.`;
-      }
-      commentBody += formatViolations(removeConflictingTagViolations, summary);
-    }
     commentBody +=
       '**The end of the violation section. All the stuff below is FYI purposes only.**\n\n';
     commentBody += '---\n';
@@ -464,6 +507,18 @@ async function scanPullRequest(
     commentBody += formatExpandable(summary, detail);
   }
 
+  // Trim the commentBody when it's too long.
+  if (commentBody.length > MAX_CHARS_IN_COMMENT) {
+    commentBody = commentBody.substring(0, MAX_CHARS_IN_COMMENT);
+    // Also trim the string after the last newline to prevent a broken
+    // UI rendering.
+    const newLineIndex = commentBody.lastIndexOf('\n');
+    if (newLineIndex !== -1) {
+      commentBody = commentBody.substring(0, newLineIndex);
+    }
+    commentBody += '\n...(The comment is too long, omitted)\n';
+  }
+
   commentBody += `---
 This comment is generated by [snippet-bot](https://github.com/apps/snippet-bot).
 If you find problems with this result, please file an issue at:
@@ -472,14 +527,53 @@ To update this comment, add \`${REFRESH_LABEL}\` label or use the checkbox below
 ${REFRESH_UI}
 `;
 
+  // The bot should not add a new comment when there's no region tag
+  // changes, so we pass `onlyUpdate` flag.
+  const onlyUpdate = result.changes.length === 0;
   await addOrUpdateIssueComment(
     context.octokit,
     owner,
     repo,
     prNumber,
-    installationId,
-    commentBody
+    installationId as number,
+    commentBody,
+    onlyUpdate
   );
+
+  // Status checks for missing region tag prefix
+  if (
+    configuration.alwaysCreateStatusCheck() ||
+    configuration.aggregateChecks() ||
+    productPrefixViolations.length > 0
+  ) {
+    await aggregator.add(prefixCheckParams);
+  }
+
+  // Status checks for disruptive region tag removal
+  if (
+    configuration.alwaysCreateStatusCheck() ||
+    configuration.aggregateChecks() ||
+    removeUsedTagViolations.length > 0
+  ) {
+    await aggregator.add(removeUsedTagCheckParams);
+  }
+  await aggregator.submit();
+  // emit metrics
+  logger.metric('snippet-bot-violations', {
+    target: pull_request.url,
+    violation_type: 'UNMATCHED_REGION_TAG',
+    count: failureMessages.length,
+  });
+  logger.metric('snippet-bot-violations', {
+    target: pull_request.url,
+    violation_type: 'MISSING_PRODUCT_PREFIX',
+    count: productPrefixViolations.length,
+  });
+  logger.metric('snippet-bot-violations', {
+    target: pull_request.url,
+    violation_type: 'REMOVING_USED_TAG',
+    count: removeUsedTagViolations.length,
+  });
 }
 
 /**
@@ -491,6 +585,23 @@ function getCommentMark(installationId: number | undefined): string {
 }
 
 export = (app: Probot) => {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  app.on('schedule.repository' as any, async context => {
+    const owner = context.payload.organization.login;
+    const repo = context.payload.repository.name;
+    const configOptions = await getConfig<ConfigurationOptions>(
+      context.octokit,
+      owner,
+      repo,
+      CONFIGURATION_FILE_PATH,
+      {schema: schema}
+    );
+    if (configOptions === null) {
+      logger.info(`snippet-bot is not configured for ${owner}/${repo}.`);
+      return;
+    }
+    await syncLabels(context.octokit, owner, repo, SNIPPET_BOT_LABELS);
+  });
   app.on('issue_comment.edited', async context => {
     const commentMark = getCommentMark(context.payload.installation?.id);
 
@@ -503,7 +614,15 @@ export = (app: Probot) => {
       return;
     }
     const repoUrl = context.payload.repository.full_name;
-    const configOptions = await getConfigOptions(context);
+
+    const {owner, repo} = context.repo();
+    const configOptions = await getConfig<ConfigurationOptions>(
+      context.octokit,
+      owner,
+      repo,
+      CONFIGURATION_FILE_PATH,
+      {schema: schema}
+    );
 
     if (configOptions === null) {
       logger.info(`snippet-bot is not configured for ${repoUrl}.`);
@@ -514,8 +633,6 @@ export = (app: Probot) => {
       ...configOptions,
     });
     logger.info({config: configuration});
-    const owner = context.payload.repository.owner.login;
-    const repo = context.payload.repository.name;
     const prNumber = context.payload.issue.number;
     const prResponse = await context.octokit.pulls.get({
       owner: owner,
@@ -528,7 +645,7 @@ export = (app: Probot) => {
     // Examine the pull request.
     await scanPullRequest(
       context,
-      prResponse.data as EventPayloads.WebhookPayloadPullRequestPullRequest,
+      prResponse.data as PullRequest,
       configuration,
       true
     );
@@ -536,7 +653,14 @@ export = (app: Probot) => {
 
   app.on(['issues.opened', 'issues.reopened'], async context => {
     const repoUrl = context.payload.repository.full_name;
-    const configOptions = await getConfigOptions(context);
+    const {owner, repo} = context.repo();
+    const configOptions = await getConfig<ConfigurationOptions>(
+      context.octokit,
+      owner,
+      repo,
+      CONFIGURATION_FILE_PATH,
+      {schema: schema}
+    );
 
     if (configOptions === null) {
       logger.info(`snippet-bot is not configured for ${repoUrl}.`);
@@ -552,7 +676,14 @@ export = (app: Probot) => {
 
   app.on('pull_request.labeled', async context => {
     const repoUrl = context.payload.repository.full_name;
-    const configOptions = await getConfigOptions(context);
+    const {owner, repo} = context.repo();
+    const configOptions = await getConfig<ConfigurationOptions>(
+      context.octokit,
+      owner,
+      repo,
+      CONFIGURATION_FILE_PATH,
+      {schema: schema}
+    );
 
     if (configOptions === null) {
       logger.info(`snippet-bot is not configured for ${repoUrl}.`);
@@ -581,7 +712,8 @@ export = (app: Probot) => {
       await context.octokit.issues.removeLabel(
         context.issue({name: REFRESH_LABEL})
       );
-    } catch (err) {
+    } catch (e) {
+      const err = e as RequestError;
       // Ignoring 404 errors.
       if (err.status !== 404) {
         throw err;
@@ -593,7 +725,7 @@ export = (app: Probot) => {
     // Examine the pull request.
     await scanPullRequest(
       context,
-      context.payload.pull_request,
+      context.payload.pull_request as PullRequest,
       configuration,
       true
     );
@@ -624,10 +756,31 @@ export = (app: Probot) => {
         );
         return;
       }
-
       const repoUrl = context.payload.repository.full_name;
-      const configOptions = await getConfigOptions(context);
+      const {owner, repo} = context.repo();
 
+      // We should first check the config schema. Otherwise, we'll miss
+      // the opportunity for checking the schema when adding the config
+      // file for the first time.
+      const configChecker = new ConfigChecker<ConfigurationOptions>(
+        schema,
+        CONFIGURATION_FILE_PATH
+      );
+      await configChecker.validateConfigChanges(
+        context.octokit,
+        owner,
+        repo,
+        context.payload.pull_request.head.sha,
+        context.payload.pull_request.number
+      );
+
+      const configOptions = await getConfig<ConfigurationOptions>(
+        context.octokit,
+        owner,
+        repo,
+        CONFIGURATION_FILE_PATH,
+        {schema: schema}
+      );
       if (configOptions === null) {
         logger.info(`snippet-bot is not configured for ${repoUrl}.`);
         return;
@@ -639,7 +792,7 @@ export = (app: Probot) => {
       logger.info({config: configuration});
       await scanPullRequest(
         context,
-        context.payload.pull_request,
+        context.payload.pull_request as PullRequest,
         configuration
       );
     }

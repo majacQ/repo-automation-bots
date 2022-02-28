@@ -25,8 +25,10 @@ type PullsListCommitsResponseData = components['schemas']['commit'][];
 // modify rules slightly:
 // see: https://github.com/conventional-changelog/commitlint/blob/master/%40commitlint/config-conventional/index.js
 delete rules['type-enum'];
+delete rules['subject-full-stop'];
 rules['header-max-length'] = [2, 'always', 256];
 rules['body-max-line-length'] = [2, 'always', 256];
+rules['footer-max-line-length'] = [2, 'always', 256];
 
 type Label = {
   name: string;
@@ -54,8 +56,9 @@ export = (app: Probot) => {
     let commits: PullsListCommitsResponseData;
     try {
       commits = (await context.octokit.pulls.listCommits(commitParams)).data;
-    } catch (err) {
-      app.log.error(err);
+    } catch (e) {
+      const err = e as Error;
+      logger.error(err);
       return;
     }
     if (commits.length === 0) {
@@ -71,11 +74,20 @@ export = (app: Probot) => {
         return label.name;
       })
       .includes(AUTOMERGE_LABEL);
+
+    const autoMergeEnabledStatus = (
+      await context.octokit.pulls.get(commitParams)
+    ).data.auto_merge;
+
+    const hasAutoMergeEnabled =
+      autoMergeEnabledStatus &&
+      autoMergeEnabledStatus?.merge_method === 'squash';
+
     // if there is only one commit, and we're not not using automerge
     // to land the pull request, lint the commit rather than the title.
     // This is done because GitHub uses the commit title, rather than the
     // issue title, if there is only one commit:
-    if (commits.length === 1 && !hasAutomergeLabel) {
+    if (commits.length === 1 && !hasAutomergeLabel && !hasAutoMergeEnabled) {
       message = commits[0].commit.message;
     }
 

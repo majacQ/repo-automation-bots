@@ -15,12 +15,20 @@
 // eslint-disable-next-line node/no-extraneous-import
 import {Probot} from 'probot';
 import {GCFBootstrapper} from 'gcf-utils';
-import owlBot from './owl-bot';
+import {OwlBot} from './owl-bot';
 const bootstrap = new GCFBootstrapper();
 // Unlike other probot apps, owl-bot-post-processor requires the ability
 // to generate its own auth token for Cloud Build, we use the helper in
 // GCFBootstrapper to load this from Secret Manager:
-module.exports.owl_bot = bootstrap.gcf(async (app: Probot) => {
-  const config = await bootstrap.getProbotConfig(false);
-  owlBot(config.privateKey, app);
-});
+module.exports.owl_bot = bootstrap.gcf(
+  async (app: Probot) => {
+    const config = await bootstrap.getProbotConfig(false);
+    OwlBot(config.privateKey, app);
+  },
+  // owl-bot typically waits for a Cloud Build build to finish.
+  // Cloud Build has a limit for number of concurrent builds, so
+  // owl-bot tends to hit the 540s (9 mins) timeout.
+  // We bump the maxRetries to 30 so that the bot will likely finish
+  // the jobs even there are bunch of Cloud Build builds.
+  {maxRetries: 30, maxPubSubRetries: 3}
+);

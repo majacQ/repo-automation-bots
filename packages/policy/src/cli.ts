@@ -15,16 +15,19 @@
 // limitations under the License.
 
 import meow from 'meow';
+// eslint-disable-next-line node/no-extraneous-import
 import {Octokit} from '@octokit/rest';
 import {exportToBigQuery} from './export';
 import {getPolicy, GitHubRepo} from './policy';
-import {submitFixes} from './changer';
+import {getChanger} from './changer';
+import {openIssue} from './issue';
 
 interface Flags {
   repo?: string;
   search?: string;
   export?: boolean;
   autofix?: boolean;
+  report?: boolean;
 }
 
 const cli = meow(
@@ -37,9 +40,10 @@ const cli = meow(
     --search      Provide a GitHub repository search filter to limit the repositories used
     --export      Export the results to BigQuery.
     --autofix     Where possible, submit a PR to fix any issues.
+    --report      Create or update a GitHub Issue documenting the gaps
 
 	Examples
-    $ policy [--repo][--search QUERY][--autofix]
+    $ policy [--repo][--search QUERY][--autofix][--report]
 
 `,
   {
@@ -47,22 +51,21 @@ const cli = meow(
       repo: {type: 'string'},
       search: {type: 'string'},
       autofix: {type: 'boolean'},
+      report: {type: 'boolean'},
     },
   }
 );
 
 export async function main(cli: meow.Result<{}>) {
-  const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
+  const auth = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
   const flags = cli.flags as Flags;
-  if (!token) {
+  if (!auth) {
     throw new Error(
       'The GITHUB_TOKEN or GH_TOKEN env var must be set with a personal access token'
     );
   }
   const repos: GitHubRepo[] = [];
-  const octokit = new Octokit({
-    auth: token,
-  });
+  const octokit = new Octokit({auth});
   const policy = getPolicy(octokit, console);
   if (flags.repo) {
     const repo = await policy.getRepo(flags.repo);
@@ -81,7 +84,11 @@ export async function main(cli: meow.Result<{}>) {
       await exportToBigQuery(res);
     }
     if (flags.autofix) {
-      await submitFixes(res, octokit);
+      const changer = getChanger(octokit, repo);
+      await changer.submitFixes(res);
+    }
+    if (flags.report) {
+      await openIssue(octokit, res);
     }
   }
 }

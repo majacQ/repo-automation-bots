@@ -17,50 +17,27 @@
 set -e
 set -o pipefail
 
-if [ $# -ne 3 ]; then
+if [ $# -ne 4 ]; then
     echo "Wrong number of arguments passed" && exit 1
 fi
 
 SCHEDULER_SERVICE_ACCOUNT_EMAIL=$1
 FUNCTION_REGION=$2
 REGION=$3
+DIRECTORY=$4
 
-# Get the endpoint for serverless-scheduler-proxy
-proxyurl=$(gcloud beta run services describe serverless-scheduler-proxy \
-    --platform managed \
-    --region "$REGION" \
-    --format="value(status.address.url)")
+if [[ -z "${PROJECT_ID}" ]]; then
+    PROJECT_ID=repo-automation-bots
+fi
 
-# For each bot that has a cron file make a Cloud Scheduler Schedule job
-# to hit the proxy endpoint on that schedule
-cd packages || exit 1
-for f in *; do
-    # Skip symlinks and our gcf-utils/generate-bot directory as it is not a function
-    if [[ -d "$f" && ! -L "$f" && "$f" != "gcf-utils" && "$f" != "generate-bot" && "$f" != "monitoring-system" ]]; then
-        cd "$f" || exit 1
-        echo "$f"
-        for fx in *; do
-            # Check for a file named "cron"
-            if [[ -f "$fx" && ! -L "$fx"  && "$fx" == "cron" ]]; then
-                functionname=${f//-/_}
-                schedule=$(cat "$fx")
-                if gcloud beta scheduler jobs describe "$functionname" 2>/dev/null; then
-                    # We have an existing job. Update the schedule
-                    gcloud beta scheduler jobs update http "$functionname" --schedule "$schedule" \
-                            --uri="$proxyurl/v0"
-                    else
-                    # Make a cloud scheduler job
-                    gcloud beta scheduler jobs create http "$functionname" \
-                            --schedule "$schedule" \
-                            --http-method=POST \
-                            --uri="$proxyurl/v0" \
-                            --oidc-service-account-email="$SCHEDULER_SERVICE_ACCOUNT_EMAIL" \
-                            --oidc-token-audience="$proxyurl" \
-                            --message-body="{\"Name\": \"$functionname\", \"Type\" : \"function\", \"Location\": \"$FUNCTION_REGION\"}" \
-                            --headers=Content-Type=application/json
-                fi
-            fi
-        done
-        cd ..
-    fi
-done
+npm i -g @google-automations/cron-utils
+
+pushd "${DIRECTORY}"
+FUNCTION_NAME=$(echo "${DIRECTORY}" | rev | cut -d/ -f1 | rev | tr '-' '_')
+
+cron-utils deploy \
+  --scheduler-service-account="$SCHEDULER_SERVICE_ACCOUNT_EMAIL" \
+  --function-region="$FUNCTION_REGION" \
+  --region="${REGION}" \
+  --function-name="${FUNCTION_NAME}" \
+  --project="${PROJECT_ID}"

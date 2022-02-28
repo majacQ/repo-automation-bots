@@ -1,7 +1,8 @@
 {
   "extends": [
     "config:base",
-    "docker:disable"
+    "docker:disable",
+    ":disableDependencyDashboard"
   ],
   "pinVersions": false,
   "rebaseStalePrs": true,
@@ -16,7 +17,7 @@
     },
     {
       "packageNames": ["google.golang.org/genproto"],
-      "schedule": "after 2pm on monday"
+      "schedule": "after 7pm on monday"
     }
   ],
   "lockFileMaintenance": {

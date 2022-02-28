@@ -19,10 +19,17 @@ import {openPR} from './commands/open-pr';
 import {scanConfigs} from './commands/scan-configs';
 import {validate} from './commands/validate';
 import {enqueueCopyTasks} from './commands/enqueue-copy-tasks';
-import {copyExists} from './commands/copy-exists';
 import {copyCodeCommand} from './commands/copy-code';
 import {copyCodeAndCreatePullRequestCommand} from './commands/copy-code-and-create-pull-request';
 import {scanGoogleapisGenAndCreatePullRequestsCommand} from './commands/scan-googleapis-gen-and-create-pull-requests';
+import {writeLock} from './commands/write-lock';
+import {maybeCreatePullRequestForLockUpdateCommand} from './commands/maybe-create-pull-request-for-lock-update';
+import {testWebhook} from './commands/test-webhook';
+import {copyCodeIntoPullRequestCommand} from './commands/copy-code-into-pull-request';
+import {copyBazelBin} from './commands/copy-bazel-bin';
+import {scanAndRetryFailedLockUpdatesCommand} from './commands/scan-and-retry-failed-lock-updates';
+import {commitPostProcessorUpdateCommand} from './commands/commit-post-processor-update';
+import {maybeCreatePullRequestForCopyCommand} from './commands/maybe-create-pull-request-for-copy';
 
 yargs(process.argv.slice(2))
   .command(triggerBuildCommand)
@@ -30,10 +37,17 @@ yargs(process.argv.slice(2))
   .command(scanConfigs)
   .command(validate)
   .command(enqueueCopyTasks)
-  .command(copyExists)
   .command(copyCodeCommand)
+  .command(copyBazelBin)
   .command(scanGoogleapisGenAndCreatePullRequestsCommand)
   .command(copyCodeAndCreatePullRequestCommand)
+  .command(writeLock)
+  .command(maybeCreatePullRequestForLockUpdateCommand)
+  .command(maybeCreatePullRequestForCopyCommand)
+  .command(testWebhook)
+  .command(copyCodeIntoPullRequestCommand)
+  .command(scanAndRetryFailedLockUpdatesCommand)
+  .command(commitPostProcessorUpdateCommand)
   .demandCommand(1)
   .strictCommands()
   .parse();

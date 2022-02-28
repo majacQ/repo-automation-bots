@@ -13,31 +13,39 @@
 // limitations under the License.
 
 // eslint-disable-next-line node/no-extraneous-import
-import {Probot, Context, ProbotOctokit} from 'probot';
+import {Probot, Context} from 'probot';
+// eslint-disable-next-line node/no-extraneous-import
+import {RequestError} from '@octokit/types';
+// eslint-disable-next-line node/no-extraneous-import
+import {Octokit} from '@octokit/rest';
 import {Datastore} from '@google-cloud/datastore';
+import {syncLabels} from '@google-automations/label-utils';
 import {mergeOnGreen} from './merge-logic';
 import {logger} from 'gcf-utils';
-
-type GitHubType = InstanceType<typeof ProbotOctokit>;
+import {
+  MERGE_ON_GREEN_LABEL,
+  MERGE_ON_GREEN_LABEL_SECURE,
+  MERGE_ON_GREEN_LABELS,
+} from './labels';
 
 const TABLE = 'mog-prs';
 const datastore = new Datastore();
 const MAX_TEST_TIME = 1000 * 60 * 60 * 6; // 6 hr.
-const MERGE_ON_GREEN_LABEL = 'automerge';
-const MERGE_ON_GREEN_LABEL_SECURE = 'automerge: exact';
 const WORKER_SIZE = 4;
+const MAX_ENTRIES = 25;
 
 handler.allowlist = [
   'googleapis',
   'yargs',
   'googlecloudplatform',
   'google',
+  'google-github-actions',
   'bcoe',
   'sofisl',
   'firebase',
 ];
 
-interface DatastorePR {
+export interface DatastorePR {
   number: number;
   repo: string;
   owner: string;
@@ -48,6 +56,7 @@ interface DatastorePR {
   url: string;
   reactionId: number;
   installationId?: number;
+  created: string;
 }
 
 interface IncomingPR {
@@ -67,12 +76,32 @@ interface Label {
 }
 
 /**
+ * Reduces the list of PRs to search by chunk sizes if there are more entries than 1 chunk allows
+ * @returns an array of Datastore PRs
+ */
+handler.maybeReducePRList = function maybeReducePRList(prs: DatastorePR[]) {
+  let prsReduced: DatastorePR[] = [];
+  if (prs.length >= MAX_ENTRIES) {
+    for (let i = 0; i < MAX_ENTRIES; i++) {
+      const index = Math.round(Math.random() * prs.length);
+      prsReduced = prsReduced.concat(prs.splice(index, 1));
+    }
+  }
+
+  return prsReduced.length ? [prsReduced] : [prs];
+};
+
+/**
  * Retrieves Query response from Datastore
  * @returns a Promise that can have any data type as it is the result of the Query, plus some standard types like the query key
  */
-handler.getDatastore = async function getDatastore() {
-  const query = datastore.createQuery(TABLE).order('created');
+handler.getDatastore = async function getDatastore(installationId?: number) {
+  let query = datastore.createQuery(TABLE).order('created');
+  if (installationId) {
+    query = query.filter('installationId', installationId);
+  }
   const [prs] = await datastore.runQuery(query);
+
   return [prs];
 };
 
@@ -81,14 +110,17 @@ handler.getDatastore = async function getDatastore() {
  * @returns an array of PRs that merge-on-green will then read, which includes the PR's
  * number, state, repo, owner and url (distinct identifier)
  */
-handler.listPRs = async function listPRs(): Promise<DatastorePR[]> {
-  const [prs] = await handler.getDatastore();
+handler.listPRs = async function listPRs(
+  installationId?: number
+): Promise<DatastorePR[]> {
+  const [prsDatastore] = await handler.getDatastore(installationId);
+  const [prs] = handler.maybeReducePRList(prsDatastore);
   const result: DatastorePR[] = [];
   for (const pr of prs) {
     const created = new Date(pr.created).getTime();
     const now = new Date().getTime();
     let state = 'continue';
-    const url = pr[datastore.KEY]?.name;
+    const url = (pr as any)[datastore.KEY]?.name;
     //TODO: I'd prefer to not have a "list" method that has side effects - perhaps later refactor
     //this to do the list, then have an explicit loop over the returned WatchPR objects that removes the expired ones.
     if (now - created > MAX_TEST_TIME) {
@@ -96,6 +128,7 @@ handler.listPRs = async function listPRs(): Promise<DatastorePR[]> {
     }
     const watchPr: DatastorePR = {
       number: pr.number,
+      created: pr.created,
       repo: pr.repo,
       owner: pr.owner,
       state: state as 'continue' | 'stop',
@@ -148,14 +181,22 @@ handler.cleanUpPullRequest = async function cleanUpPullRequest(
   prNumber: number,
   label: string,
   reactionId: number,
-  github: GitHubType
+  github: Octokit
 ) {
-  await github.issues.removeLabel({
-    owner,
-    repo,
-    issue_number: prNumber,
-    name: label,
-  });
+  try {
+    await github.issues.removeLabel({
+      owner,
+      repo,
+      issue_number: prNumber,
+      name: label,
+    });
+  } catch (e) {
+    const err = e as RequestError;
+    // Ignoring 404 errors.
+    if (err.status !== 404) {
+      throw err;
+    }
+  }
   await github.reactions.deleteForIssue({
     owner,
     repo,
@@ -180,7 +221,7 @@ handler.checkIfPRIsInvalid = async function checkIfPRIsInvalid(
   label: string,
   reactionId: number,
   url: string,
-  github: GitHubType
+  github: Octokit
 ) {
   let pr;
   let labels;
@@ -240,7 +281,7 @@ handler.checkForBranchProtection = async function checkForBranchProtection(
   repo: string,
   prNumber: number,
   baseBranch: string | undefined,
-  github: GitHubType
+  github: Octokit
 ): Promise<string[] | undefined> {
   let branchProtection: string[] | undefined;
   // Check to see if branch protection exists
@@ -255,12 +296,13 @@ handler.checkForBranchProtection = async function checkForBranchProtection(
         repo,
         branch,
       })
-    ).data.required_status_checks.contexts;
+    ).data.required_status_checks?.contexts;
     logger.info(
       `checking branch protection for ${owner}/${repo}: ${branchProtection}`
     );
     // if branch protection doesn't exist, leave a comment on the PR;
-  } catch (err) {
+  } catch (e) {
+    const err = e as Error;
     err.message = `Error in getting branch protection\n\n${err.message}`;
     await github.issues.createComment({
       owner,
@@ -282,7 +324,7 @@ handler.checkForBranchProtection = async function checkForBranchProtection(
 handler.addPR = async function addPR(
   incomingPR: IncomingPR,
   url: string,
-  github: GitHubType
+  github: Octokit
 ) {
   let branchProtection: string[] | undefined;
   try {
@@ -293,9 +335,10 @@ handler.addPR = async function addPR(
       incomingPR.branch,
       github
     );
-  } catch (err) {
+  } catch (e) {
+    const err = e as Error;
     err.message = `Error in getting branch protection\n\n${err.message}`;
-    logger.error(err.message);
+    logger.error(err);
   }
 
   // if the owner has branch protection set up, add this PR to the Datastore table
@@ -328,6 +371,9 @@ handler.addPR = async function addPR(
       method: 'upsert',
     };
     await datastore.save(entity);
+    logger.metric('merge_on_green.labeled', {
+      repo: `${incomingPR.owner}/${incomingPR.repo}`,
+    });
   }
 };
 
@@ -374,17 +420,13 @@ handler.cleanDatastoreTable = async function cleanDatastoreTable(
  */
 handler.checkPRMergeability = async function checkPRMergeability(
   watchedPRs: DatastorePR[],
-  app: Probot,
-  context: Context
+  octokit: Octokit
 ) {
   while (watchedPRs.length) {
     const work = watchedPRs.splice(0, WORKER_SIZE);
     await Promise.all(
       work.map(async wp => {
         logger.info(`checking ${wp.url}, ${wp.installationId}`);
-        const github = wp.installationId
-          ? await app.auth(wp.installationId)
-          : context.octokit;
         try {
           const remove = await mergeOnGreen(
             wp.owner,
@@ -395,7 +437,7 @@ handler.checkPRMergeability = async function checkPRMergeability(
             wp.branchProtection!,
             wp.label,
             wp.author,
-            github
+            octokit
           );
           if (remove || wp.state === 'stop') {
             await handler.removePR(wp.url);
@@ -406,7 +448,7 @@ handler.checkPRMergeability = async function checkPRMergeability(
                 wp.number,
                 wp.label,
                 wp.reactionId,
-                github
+                octokit
               );
             } catch (err) {
               logger.warn(
@@ -414,7 +456,8 @@ handler.checkPRMergeability = async function checkPRMergeability(
               );
             }
           }
-        } catch (err) {
+        } catch (e) {
+          const err = e as Error;
           err.message = `Error in merge-on-green: \n\n${err.message}`;
           logger.error(err);
         }
@@ -429,7 +472,7 @@ handler.checkPRMergeability = async function checkPRMergeability(
  * @returns void
  */
 handler.scanForMissingPullRequests = async function scanForMissingPullRequests(
-  github: GitHubType,
+  github: Octokit,
   org: string
 ) {
   // Github does not support searching the labels with 'OR'.
@@ -448,6 +491,13 @@ handler.scanForMissingPullRequests = async function scanForMissingPullRequests(
       const ownerAndRepoArray = issue.repository_url.split('/');
       const owner = ownerAndRepoArray[ownerAndRepoArray.length - 2];
       const repo = ownerAndRepoArray[ownerAndRepoArray.length - 1];
+      const installationId = (
+        await github.apps.getRepoInstallation({
+          owner,
+          repo,
+        })
+      ).data.id;
+
       await handler.addPR(
         {
           number: issue.number,
@@ -456,7 +506,8 @@ handler.scanForMissingPullRequests = async function scanForMissingPullRequests(
           state: 'continue',
           url: issue.html_url,
           label: MERGE_ON_GREEN_LABEL,
-          author: issue.user.login,
+          author: issue.user?.login || '',
+          installationId,
         },
         issue.html_url,
         github
@@ -470,6 +521,12 @@ handler.scanForMissingPullRequests = async function scanForMissingPullRequests(
       const ownerAndRepoArray = issue.repository_url.split('/');
       const owner = ownerAndRepoArray[ownerAndRepoArray.length - 2];
       const repo = ownerAndRepoArray[ownerAndRepoArray.length - 1];
+      const installationId = (
+        await github.apps.getRepoInstallation({
+          owner,
+          repo,
+        })
+      ).data.id;
       await handler.addPR(
         {
           number: issue.number,
@@ -478,7 +535,8 @@ handler.scanForMissingPullRequests = async function scanForMissingPullRequests(
           state: 'continue',
           url: issue.html_url,
           label: MERGE_ON_GREEN_LABEL_SECURE,
-          author: issue.user.login,
+          author: issue.user?.login || '',
+          installationId,
         },
         issue.html_url,
         github
@@ -496,31 +554,85 @@ handler.scanForMissingPullRequests = async function scanForMissingPullRequests(
  * @param app type probot
  * @returns void
  */
-function handler(app: Probot) {
-  //meta-note about the schedule.repository as any; currently GH does not support this type, see
-  //open issue for a fix: https://github.com/octokit/webhooks.js/issues/277
-  app.on('schedule.repository' as '*', async context => {
-    const watchedPRs = await handler.listPRs();
-    if (context.payload.cleanUp === true) {
-      logger.info('Entering clean up cron job');
-      await handler.cleanDatastoreTable(watchedPRs, app, context);
+export function handler(app: Probot) {
+  // This scheduled job iterates through the PR database and removes PRs
+  // That are closed or do not have an applicable label anymore.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  app.on('schedule.global' as any, async context => {
+    if (context.payload.cleanUp !== true) {
       return;
     }
 
-    if (context.payload.find_hanging_prs === true) {
-      logger.info('Entering job to pick up any hanging PRs');
-      // we cannot search in an org without the bot installation ID, so we need
-      // to divide up the cron jobs based on org
-      await handler.scanForMissingPullRequests(
-        context.octokit,
-        context.payload.org
+    logger.info('Starting clean up job');
+    const watchedPRs = await handler.listPRs();
+    await handler.cleanDatastoreTable(watchedPRs, app, context);
+  });
+
+  // This scheduled job looks for PRs that have an applicable label
+  // but are not in the database for whatever reason (missed webhook).
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  app.on('schedule.installation' as any, async context => {
+    if (context.payload.findHangingPRs !== true) {
+      return;
+    }
+
+    if (!context.payload.cron_org) {
+      logger.warn('Cannot look for hanging PRs for non-org installations');
+      return;
+    }
+
+    if (!handler.allowlist.includes(context.payload.cron_org)) {
+      logger.info(
+        `skipped ${context.payload.cron_org} because not a part of allowlist`
       );
       return;
     }
+
+    const installationId = context.payload.installation.id;
+    logger.info(`Looking for hanging PRs for installation: ${installationId}`);
+    // we cannot search in an org without the bot installation ID, so we need
+    // to divide up the cron jobs based on org
+    await handler.scanForMissingPullRequests(
+      context.octokit,
+      context.payload.cron_org
+    );
+    return;
+  });
+
+  // This scheduled job is the main recurring job that attempts to merge
+  // mergeable PRs.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  app.on('schedule.installation' as any, async context => {
+    if (context.payload.performMerge !== true) {
+      return;
+    }
+
+    const installationId = context.payload.installation.id;
+    if (!installationId) {
+      logger.warn('no installation id');
+      return;
+    }
+
+    logger.info(`Starting merge checks for installation: ${installationId}`);
+    const watchedPRs = await handler.listPRs(installationId);
     const start = Date.now();
-    await handler.checkPRMergeability(watchedPRs, app, context);
+    await handler.checkPRMergeability(watchedPRs, context.octokit);
     logger.info(`mergeOnGreen check took ${Date.now() - start}ms`);
   });
+
+  // This scheduled job ensures that every installed repository has the
+  // merge-on-green labels created and available.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  app.on('schedule.repository' as any, async context => {
+    if (context.payload.syncLabels !== true) {
+      return;
+    }
+    const owner = context.payload.organization.login;
+    const repo = context.payload.repository.name;
+    logger.info(`Starting label sync for ${owner}/${repo}`);
+    await syncLabels(context.octokit, owner, repo, MERGE_ON_GREEN_LABELS);
+  });
+
   app.on('pull_request.labeled', async context => {
     const prNumber = context.payload.pull_request.number;
     const author = context.payload.pull_request.user.login;
@@ -528,12 +640,7 @@ function handler(app: Probot) {
     const repo = context.payload.repository.name;
     const installationId = context.payload.installation?.id;
 
-    const label = context.payload.pull_request.labels.find(
-      (label: Label) =>
-        label.name === MERGE_ON_GREEN_LABEL ||
-        label.name === MERGE_ON_GREEN_LABEL_SECURE
-    );
-
+    // Limit functionality to an allowlist
     if (
       !handler.allowlist.find(
         element => element.toLowerCase() === owner.toLowerCase()
@@ -542,6 +649,12 @@ function handler(app: Probot) {
       logger.info(`skipped ${owner}/${repo} because not a part of allowlist`);
       return;
     }
+
+    const label = context.payload.pull_request.labels.find(
+      (label: Label) =>
+        label.name === MERGE_ON_GREEN_LABEL ||
+        label.name === MERGE_ON_GREEN_LABEL_SECURE
+    );
     // if missing the label, skip
     if (!label) {
       logger.info('ignoring non-MOG label');
@@ -604,12 +717,12 @@ function handler(app: Probot) {
         prNumber,
         watchedPullRequest.label,
         watchedPullRequest.reactionId,
-        context.octokit
+        (await app.auth(watchedPullRequest.installationId)) ?? context.octokit
       );
     }
   });
 
-  app.on(['pull_request.closed', 'pull_request.merged'], async context => {
+  app.on(['pull_request.closed'], async (context: Context<'pull_request'>) => {
     const prNumber = context.payload.pull_request.number;
     const owner = context.payload.repository.owner.login;
     const repo = context.payload.repository.name;
@@ -633,5 +746,3 @@ function handler(app: Probot) {
     }
   });
 }
-
-export = handler;

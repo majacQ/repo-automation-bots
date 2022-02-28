@@ -1,0 +1,53 @@
+{
+  "name": "@google-automations/object-selector",
+  "version": "2.0.0",
+  "description": "Utilities for selecting objects",
+  "scripts": {
+    "compile": "tsc -p .",
+    "pretest": "npm run compile",
+    "prepare": "npm run compile",
+    "test": "cross-env NODE_ENV=test LOG_LEVEL=fatal c8 mocha ./build/test",
+    "test:snap": "SNAPSHOT_UPDATE=1 npm test",
+    "fix": "gts fix",
+    "lint": "gts check"
+  },
+  "main": "./build/src/object-selector.js",
+  "bin": "build/src/cli.js",
+  "repository": "https://github.com/googleapis/repo-automation-bots.git",
+  "homepage": "https://github.com/googleapis/repo-automation-bots",
+  "bugs": "https://github.com/googleapis/repo-automation-bots/issues",
+  "dependencies": {
+    "ajv": "^8.8.2",
+    "easy-object-selector": "^1.3.0",
+    "gcf-utils": "^13.1.0",
+    "js-yaml": "^4.1.0",
+    "yargs": "^17.2.1"
+  },
+  "devDependencies": {
+    "@types/mocha": "^9.0.0",
+    "@types/node": "^16.11.10",
+    "@types/sinon": "^10.0.6",
+    "@types/yargs": "^17.0.7",
+    "c8": "^7.10.0",
+    "cross-env": "^7.0.3",
+    "dotenv": "^16.0.0",
+    "gts": "^3.1.0",
+    "mocha": "^9.1.3",
+    "mocked-env": "^1.3.5",
+    "nock": "^13.2.1",
+    "sinon": "^13.0.0",
+    "snap-shot-it": "^7.9.6",
+    "typescript": "~4.5.2"
+  },
+  "engines": {
+    "node": ">= 12.18.2"
+  },
+  "keywords": [
+    "Github repository"
+  ],
+  "author": "Takashi Matsuo <tmatsuo@google.com>",
+  "license": "Apache-2.0",
+  "files": [
+    "build/src"
+  ]
+}

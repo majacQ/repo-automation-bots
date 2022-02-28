@@ -12,19 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// eslint-disable-next-line node/no-extraneous-import
-import {ProbotOctokit} from 'probot';
 import {logger} from 'gcf-utils';
 
-type OctokitType = InstanceType<typeof ProbotOctokit>;
+// eslint-disable-next-line node/no-extraneous-import
+import {Octokit} from '@octokit/rest';
 
 export interface Label {
   name: string;
 }
 
 interface CheckRun {
-  name: string;
-  conclusion: string;
+  name: string | null;
+  conclusion: string | null;
 }
 
 export interface CheckStatus {
@@ -71,23 +70,19 @@ interface Merge {
  * @param github unique installation id for each function
  * @returns most recent sha as a string
  */
-async function getLatestCommit(
+export async function getLatestCommit(
   owner: string,
   repo: string,
   pr: number,
-  github: OctokitType
+  github: Octokit
 ): Promise<string> {
   try {
-    // TODO: consider switching this to an async iterator, which would work
-    // for more than 100.
-    const data = await github.pulls.listCommits({
+    const commits = await github.paginate(github.pulls.listCommits, {
       owner,
       repo,
       pull_number: pr,
-      per_page: 100,
-      page: 1,
     });
-    return data.data[data.data.length - 1].sha;
+    return commits[commits.length - 1].sha;
   } catch (err) {
     return '';
   }
@@ -105,7 +100,7 @@ async function getPR(
   owner: string,
   repo: string,
   pr: number,
-  github: OctokitType
+  github: Octokit
 ): Promise<PullRequest> {
   try {
     const data = await github.pulls.get({
@@ -141,7 +136,7 @@ async function getCommentsOnPR(
   owner: string,
   repo: string,
   issue_number: number,
-  github: OctokitType
+  github: Octokit
 ): Promise<Comment[] | null> {
   try {
     const data = await github.issues.listComments({
@@ -167,7 +162,7 @@ async function getCommentsOnPR(
 async function getStatuses(
   owner: string,
   repo: string,
-  github: OctokitType,
+  github: Octokit,
   headSha: string
 ): Promise<CheckStatus[]> {
   const start = Date.now();
@@ -184,7 +179,8 @@ async function getStatuses(
       `called getStatuses in ${Date.now() - start}ms ${owner}/${repo}`
     );
     return responses;
-  } catch (err) {
+  } catch (e) {
+    const err = e as Error;
     err.message = `Error in getting statuses\n\n${err.message}`;
     logger.error(err);
     return [];
@@ -203,7 +199,7 @@ async function getStatuses(
 async function getCheckRuns(
   owner: string,
   repo: string,
-  github: OctokitType,
+  github: Octokit,
   headSha: string
 ): Promise<CheckRun[]> {
   const start = Date.now();
@@ -231,7 +227,7 @@ async function getCheckRuns(
 function checkForRequiredSC(checkRuns: CheckRun[], check: string) {
   if (checkRuns.length !== 0) {
     const checkRunCompleted = checkRuns.find(element =>
-      element.name.startsWith(check)
+      element.name?.startsWith(check)
     );
     if (
       checkRunCompleted !== undefined &&
@@ -260,7 +256,7 @@ async function statusesForRef(
   pr: number,
   requiredChecks: string[],
   headSha: string,
-  github: OctokitType
+  github: Octokit
 ): Promise<boolean> {
   const start = Date.now();
   const checkStatus = await getStatuses(owner, repo, github, headSha);
@@ -323,7 +319,7 @@ async function getReviewsCompleted(
   owner: string,
   repo: string,
   pr: number,
-  github: OctokitType
+  github: Octokit
 ): Promise<Reviews[]> {
   try {
     const reviewsCompleted = await github.pulls.listReviews({
@@ -332,7 +328,8 @@ async function getReviewsCompleted(
       pull_number: pr,
     });
     return reviewsCompleted.data as Reviews[];
-  } catch (err) {
+  } catch (e) {
+    const err = e as Error;
     err.message = `Error getting reviews completed\n\n${err.message}`;
     logger.error(err);
     return [];
@@ -376,7 +373,7 @@ async function checkReviews(
   label: string,
   secureLabel: string,
   headSha: string,
-  github: OctokitType
+  github: Octokit
 ): Promise<boolean> {
   const start = Date.now();
   logger.info(`=== checking required reviews ${owner}/${repo}/${pr} ===`);
@@ -447,7 +444,7 @@ async function merge(
   repo: string,
   pr: number,
   prInfo: PullRequest,
-  github: OctokitType
+  github: Octokit
 ): Promise<Merge> {
   const merge = (
     await github.pulls.merge({
@@ -474,7 +471,7 @@ async function updateBranch(
   owner: string,
   repo: string,
   pr: number,
-  github: OctokitType
+  github: Octokit
 ) {
   try {
     await github.pulls.updateBranch({
@@ -482,7 +479,8 @@ async function updateBranch(
       repo,
       pull_number: pr,
     });
-  } catch (err) {
+  } catch (e) {
+    const err = e as Error;
     err.message = `Error in updating branch: \n\n${err.message}`;
     logger.error(err);
   }
@@ -502,7 +500,7 @@ async function commentOnPR(
   repo: string,
   pr: number,
   body: string,
-  github: OctokitType
+  github: Octokit
 ): Promise<{} | null> {
   try {
     const data = await github.issues.createComment({
@@ -512,10 +510,36 @@ async function commentOnPR(
       body,
     });
     return data;
-  } catch (err) {
+  } catch (e) {
+    const err = e as Error;
     err.message = `There was an issue commenting on ${owner}/${repo} PR ${pr} \n\n${err.message}`;
     logger.error(err);
     return null;
+  }
+}
+
+// TODO(sofisl): Remove once metrics have been collected (06/15/21)
+// This function logs Github's mergeability assessment of a given PR, but only
+// ~20% of the time, given that this is an expensive API call, and we only care
+// about answering the question.
+async function maybeLogMergeability(
+  owner: string,
+  repo: string,
+  pr: number,
+  github: Octokit,
+  checkReviews: boolean,
+  checkStatus: boolean
+) {
+  if (Math.random() > 0.8) {
+    const prInfo = await getPR(owner, repo, pr, github);
+    logger.metric('merge_on_green.mergeability_sample', {
+      repo: `${owner}/${repo}/`,
+      number: pr,
+      mergeable: prInfo.mergeable,
+      mergeable_state: prInfo.mergeable_state,
+      checkReviews,
+      checkStatus,
+    });
   }
 }
 
@@ -539,7 +563,7 @@ export async function mergeOnGreen(
   requiredChecks: string[],
   mogLabel: string,
   author: string,
-  github: OctokitType
+  github: Octokit
 ): Promise<boolean | undefined> {
   const rateLimit = (await github.rateLimit.get()).data.resources.core
     .remaining;
@@ -582,6 +606,8 @@ export async function mergeOnGreen(
     `checkReview = ${checkReview} checkStatus = ${checkStatus} state = ${state} ${owner}/${repo}/${pr}`
   );
 
+  // TODO(sofisl): Remove once metrics have been collected (06/15/21)
+  maybeLogMergeability(owner, repo, pr, github, checkStatus, checkReview);
   //if the reviews and statuses are green, let's try to merge
   if (checkReview === true && checkStatus === true) {
     const prInfo = await getPR(owner, repo, pr, github);
@@ -593,9 +619,28 @@ export async function mergeOnGreen(
     let merged = false;
     try {
       logger.info(`attempt to merge ${owner}/${repo}/${pr}`);
+      logger.metric('merge_on_green.attempt_to_merge', {
+        repo: `${owner}/${repo}`,
+        number: pr,
+        mergeable: prInfo.mergeable,
+        mergeable_state: prInfo.mergeable_state,
+      });
       await merge(owner, repo, pr, prInfo, github);
       merged = true;
-    } catch (err) {
+      logger.metric('merge_on_green.merged', {
+        repo: `${owner}/${repo}/`,
+        number: pr,
+        mergeable: prInfo.mergeable,
+        mergeable_state: prInfo.mergeable_state,
+      });
+    } catch (e) {
+      const err = e as Error;
+      logger.metric('merge_on_green.failed_to_merge', {
+        repo: `${owner}/${repo}`,
+        number: pr,
+        mergeable: prInfo.mergeable,
+        mergeable_state: prInfo.mergeable_state,
+      });
       // Not checking here whether err.status=405 as that seems to apply to more than one error type,
       // so checking the body instead.
       if (err.message.includes('not authorized to push to this branch')) {
@@ -615,7 +660,8 @@ export async function mergeOnGreen(
         logger.info(`Attempting to update branch ${owner}/${repo}/${pr}`);
         try {
           await updateBranch(owner, repo, pr, github);
-        } catch (err) {
+        } catch (e) {
+          const err = e as Error;
           err.message = `failed to update branch ${owner}/${repo}/${pr}\n\n${err.message}`;
           logger.error(err);
         }

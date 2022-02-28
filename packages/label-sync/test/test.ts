@@ -18,16 +18,14 @@ import {describe, it, beforeEach, afterEach} from 'mocha';
 import path from 'path';
 import nock from 'nock';
 // eslint-disable-next-line node/no-extraneous-import
-import {Probot, Context, createProbot} from 'probot';
+import {Probot, Context, createProbot, ProbotOctokit} from 'probot';
 import * as sinon from 'sinon';
 import * as labelSync from '../src/label-sync';
 import * as assert from 'assert';
-// eslint-disable-next-line node/no-extraneous-import
-import {Octokit} from '@octokit/rest';
 import {config} from '@probot/octokit-plugin-config';
-import {createProbotAuth} from 'octokit-auth-probot';
-const TestingOctokit = Octokit.plugin(config).defaults({
-  authStrategy: createProbotAuth,
+const TestingOctokit = ProbotOctokit.plugin(config).defaults({
+  retry: {enabled: false},
+  throttle: {enabled: false},
 });
 
 nock.disableNetConnect();
@@ -87,7 +85,7 @@ describe('Label Sync', () => {
     probot = createProbot({
       overrides: {
         githubToken: 'abc123',
-        Octokit: TestingOctokit as any,
+        Octokit: TestingOctokit,
       },
     });
 
@@ -117,7 +115,7 @@ describe('Label Sync', () => {
       nockLabelCreate(newLabels.labels.length + 1),
     ];
     await probot.receive({
-      name: 'repository.created' as any,
+      name: 'repository',
       payload,
       id: 'abc123',
     });
@@ -151,7 +149,7 @@ describe('Label Sync', () => {
       nockLabelDelete(labelName),
     ];
     await probot.receive({
-      name: 'repository.created' as any,
+      name: 'repository',
       payload,
       id: 'abc123',
     });
@@ -169,13 +167,13 @@ describe('Label Sync', () => {
       nockLabelCreate(1),
       nockLabelUpdate(labelName),
     ];
-    await probot.receive({name: 'label.deleted' as any, payload, id: 'abc123'});
+    await probot.receive({name: 'label', payload, id: 'abc123'});
     scopes.forEach(s => s.done());
   });
 
   it('should handle missing properties on data from GCS', async () => {
     // Simulate the results coming back from DRIFT having missing fields.
-    // In this case, the `apishort_name` property is explitly missing.
+    // In this case, the `apishort_name` property is explicitly missing.
     getApiLabelsStub.restore();
     getApiLabelsStub = sandbox.stub(labelSync, 'getApiLabels').resolves({
       apis: [
@@ -195,7 +193,7 @@ describe('Label Sync', () => {
       nockLabelCreate(newLabels.labels.length),
     ];
     await probot.receive({
-      name: 'repository.created' as any,
+      name: 'repository',
       payload,
       id: 'abc123',
     });
@@ -210,12 +208,14 @@ describe('Label Sync', () => {
     ];
 
     await probot.receive({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       name: 'schedule.repository' as any,
       payload: {
         cron_org: 'Codertocat',
         organization: {login: 'Codertocat'},
         repository: {name: 'Hello-World'},
-      },
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } as any,
       id: 'abc123',
     });
 
@@ -233,7 +233,7 @@ describe('Label Sync', () => {
       nockLabelCreate(newLabels.labels.length + 1),
     ];
     await probot.receive({
-      name: 'repository.created' as any,
+      name: 'repository',
       payload,
       id: 'abc123',
     });
@@ -251,7 +251,7 @@ describe('Label Sync', () => {
       './repository_created.json'
     ));
     await probot.receive({
-      name: 'repository.created' as any,
+      name: 'repository',
       payload,
       id: 'abc123',
     });

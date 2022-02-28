@@ -13,6 +13,8 @@
 // limitations under the License.
 
 import {Octokit} from '@octokit/rest';
+// eslint-disable-next-line node/no-extraneous-import
+import {RequestError} from '@octokit/types';
 import {createPullRequest, Changes} from 'code-suggester';
 import * as yaml from 'js-yaml';
 
@@ -23,6 +25,7 @@ interface RunnerOptions {
   gitHubToken: string;
   upstreamRepo: string;
   upstreamOwner: string;
+  pullRequestTitle?: string;
 }
 
 interface ReleasePleaseBranchConfig {
@@ -41,6 +44,17 @@ interface SyncRepoSettingsConfig {
   branchProtectionRules: SyncRepoSettingsBranchConfig[];
 }
 
+interface GitHubActionConfig {
+  on: {
+    push?: {
+      branches?: string[];
+    };
+    pull_request?: {
+      branches?: string[];
+    };
+  };
+}
+
 export class Runner {
   branchName: string;
   targetTag: string;
@@ -48,6 +62,7 @@ export class Runner {
   octokit: Octokit;
   upstreamRepo: string;
   upstreamOwner: string;
+  pullRequestTitle: string | undefined;
 
   constructor(options: RunnerOptions) {
     this.branchName = options.branchName;
@@ -56,6 +71,7 @@ export class Runner {
     this.octokit = new Octokit({auth: options.gitHubToken});
     this.upstreamRepo = options.upstreamRepo;
     this.upstreamOwner = options.upstreamOwner;
+    this.pullRequestTitle = options.pullRequestTitle;
   }
 
   private async getTargetSha(tag: string): Promise<string | undefined> {
@@ -78,11 +94,20 @@ export class Runner {
       });
       return existing.data.ref;
     } catch (e) {
-      if (e.status === 404) {
+      const err = e as RequestError;
+      if (err.status === 404) {
         return undefined;
       }
       throw e;
     }
+  }
+
+  private async getDefaultBranch(): Promise<string> {
+    const response = await this.octokit.repos.get({
+      owner: this.upstreamOwner,
+      repo: this.upstreamRepo,
+    });
+    return response.data.default_branch;
   }
 
   /**
@@ -124,7 +149,8 @@ export class Runner {
       })) as {data: {content: string}};
       return Buffer.from(response.data.content, 'base64').toString('utf8');
     } catch (e) {
-      if (e.status === 404) {
+      const err = e as RequestError;
+      if (err.status === 404) {
         return undefined;
       }
       throw e;
@@ -165,7 +191,7 @@ export class Runner {
 
     if (branches.length === 0) {
       // no configured branch protection - we cannot infer what to do
-      throw new Error('Cannot find exising branch protection rules: aborting');
+      throw new Error('Cannot find existing branch protection rules: aborting');
     }
 
     if (
@@ -222,14 +248,108 @@ export class Runner {
       }
     }
 
-    const message = `build: configure branch ${this.branchName} as a release branch`;
+    const defaultBranch = await this.getDefaultBranch();
+    const message =
+      this.pullRequestTitle === undefined
+        ? `build: configure branch ${this.branchName} as a release branch`
+        : this.pullRequestTitle;
     return await createPullRequest(this.octokit, changes, {
       upstreamRepo: this.upstreamRepo,
       upstreamOwner: this.upstreamOwner,
       message,
       title: message,
       description: 'enable releases',
+      primary: defaultBranch,
       branch: `release-brancher/${this.branchName}`,
+      force: true,
+      fork: false,
+    });
+  }
+
+  /**
+   * Replace the default branch name in GitHub actions config.
+   */
+  updateWorkflow(content: string, defaultBranch: string): string {
+    const config = yaml.load(content) as GitHubActionConfig;
+    let updated = false;
+    if (config.on.push?.branches) {
+      const index = config.on.push.branches.indexOf(defaultBranch);
+      if (index !== -1) {
+        config.on.push.branches[index] = this.branchName;
+        updated = true;
+      }
+    }
+    if (config.on.pull_request?.branches) {
+      const index = config.on.pull_request.branches.indexOf(defaultBranch);
+      if (index !== -1) {
+        config.on.pull_request.branches[index] = this.branchName;
+        updated = true;
+      }
+    }
+    if (updated) {
+      return yaml.dump(config, {
+        noRefs: true,
+      });
+    }
+    return content;
+  }
+
+  /**
+   * Opens a pull request against the new release branch with updated
+   * GitHub action workflows. If an existing pull request already exists,
+   * it will force-push changes to the existing pull request.
+   *
+   * @returns {number} The pull request number.
+   */
+  async createWorkflowPullRequest(): Promise<number> {
+    const sha = await this.getTargetSha(this.targetTag);
+    if (!sha) {
+      console.log(`couldn't find SHA for tag ${this.targetTag}`);
+      throw new Error(`couldn't find SHA for tag ${this.targetTag}`);
+    }
+
+    const response = await this.octokit.git.getTree({
+      owner: this.upstreamOwner,
+      repo: this.upstreamRepo,
+      tree_sha: sha,
+      recursive: 'true',
+    });
+    const changes: Changes = new Map();
+    const files = response.data.tree.filter(file => {
+      return (
+        file.path &&
+        file.path.startsWith('.github/workflows/') &&
+        file.path.endsWith('.yaml')
+      );
+    });
+
+    const defaultBranch = await this.getDefaultBranch();
+    for (const file of files) {
+      const content = await this.getFileContents(file.path!);
+      if (content) {
+        const newContent = this.updateWorkflow(content, defaultBranch);
+        if (newContent !== content) {
+          changes.set(file.path!, {
+            mode: '100644',
+            content: newContent,
+          });
+        }
+      }
+    }
+
+    // For java-lts type, we want a release through a releasable commit ('feat: ') immediately
+    // after creating the protected branch.
+    const message =
+      (this.releaseType === 'java-lts' ? 'feat' : 'ci') +
+      ': configure the protected branch';
+    return await createPullRequest(this.octokit, changes, {
+      upstreamRepo: this.upstreamRepo,
+      upstreamOwner: this.upstreamOwner,
+      message,
+      title: message,
+      description: 'Configures CI for branch',
+      branch: `release-brancher/ci/${this.branchName}`,
+      primary: this.branchName,
       force: true,
       fork: false,
     });

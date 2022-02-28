@@ -16,7 +16,7 @@ import path from 'path';
 import * as fs from 'fs';
 
 /**
- * Creates a directory struture with files.
+ * Creates a directory structure with files.
  *
  * @param rootDir the root directory under which to create files and directories.
  * @param specs a list of files and directories in this format:
@@ -27,7 +27,9 @@ import * as fs from 'fs';
  */
 export function makeDirTree(rootDir: string, specs: string[]): void {
   for (const spec of specs) {
-    const [apath, content] = spec.split(':', 2);
+    const firstColon = spec.indexOf(':');
+    const apath = firstColon < 0 ? spec : spec.substr(0, firstColon);
+    const content = firstColon < 0 ? '' : spec.substr(firstColon + 1);
     const fpath = path.join(rootDir, apath);
     const dirName = content ? path.dirname(fpath) : fpath;
     fs.mkdirSync(dirName, {recursive: true});
@@ -45,12 +47,31 @@ export function makeDirTree(rootDir: string, specs: string[]): void {
  *      "/x/y/hello.txt:Hello World"
  *   directories lack a colon:
  *      "/empty/dir"
-
  */
 export function collectDirTree(dir: string): string[] {
+  return collectGlobResult(
+    dir,
+    glob.sync('**', {
+      cwd: dir,
+      dot: true,
+      ignore: ['.git', '.git/**'],
+    })
+  );
+}
+
+/**
+ * Collects the entire source tree content into a list that can
+ * be easily compared equal in a test.
+ * @returns Sorted list in the following format.
+ *   files are specified by <path>:<content>  For example:
+ *      "/x/y/hello.txt:Hello World"
+ *   directories lack a colon:
+ *      "/empty/dir"
+ */
+export function collectGlobResult(rootDir: string, paths: string[]): string[] {
   const tree: string[] = [];
-  for (const apath of glob.sync('**', {cwd: dir})) {
-    const fullPath = path.join(dir, apath);
+  for (const apath of paths) {
+    const fullPath = path.join(rootDir, apath);
     if (fs.lstatSync(fullPath).isDirectory()) {
       tree.push(apath);
     } else {

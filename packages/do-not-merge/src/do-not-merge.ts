@@ -15,8 +15,17 @@
 /* eslint-disable node/no-extraneous-import */
 
 import {Probot, Context} from 'probot';
-import Webhooks from '@octokit/webhooks';
 import {logger} from 'gcf-utils';
+import {
+  ConfigChecker,
+  getConfigWithDefault,
+} from '@google-automations/bot-config-utils';
+import {
+  ConfigurationOptions,
+  CONFIGURATION_FILE_PATH,
+  DEFAULT_CONFIGURATION,
+} from './configuration';
+import schema from './config-schema.json';
 
 const DO_NOT_MERGE = 'do not merge';
 const DO_NOT_MERGE_2 = 'do-not-merge';
@@ -39,9 +48,7 @@ export = (app: Probot) => {
       'pull_request.unlabeled',
       'pull_request.synchronize', // To run the check on every commit.
     ],
-    async (
-      context: Context<Webhooks.EventPayloads.WebhookPayloadPullRequest>
-    ) => {
+    async (context: Context<'pull_request'>) => {
       if (context.payload.pull_request.state === 'closed') {
         logger.info(
           `The pull request ${context.payload.pull_request.url} is closed, exiting.`
@@ -56,6 +63,19 @@ export = (app: Probot) => {
       const labelFound = context.payload.pull_request.labels.find(
         l => l.name === DO_NOT_MERGE || l.name === DO_NOT_MERGE_2
       );
+
+      let config = DEFAULT_CONFIGURATION;
+      try {
+        config = await getConfigWithDefault<ConfigurationOptions>(
+          context.octokit,
+          owner,
+          repo,
+          CONFIGURATION_FILE_PATH,
+          DEFAULT_CONFIGURATION
+        );
+      } catch (err) {
+        logger.error(err as Error);
+      }
 
       const existingCheck = await findCheck(context, owner, repo, sha);
 
@@ -75,10 +95,18 @@ export = (app: Probot) => {
             repo,
             output: SUCCESS_OUTPUT,
           });
+        } else if (config.alwaysCreateStatusCheck) {
+          await context.octokit.checks.create({
+            conclusion: 'success',
+            name: CHECK_NAME,
+            owner,
+            repo,
+            head_sha: sha,
+            output: SUCCESS_OUTPUT,
+          });
         }
         return;
       }
-      logger.info('Do not merge label found');
       if (existingCheck) {
         // If the check already exists and is _not_ a failure, make it a failure.
         if (existingCheck.conclusion !== 'failure') {
@@ -104,7 +132,6 @@ export = (app: Probot) => {
       logger.info(
         `Creating failed check on ${context.payload.pull_request.url}`
       );
-
       await context.octokit.checks.create({
         conclusion: 'failure',
         name: CHECK_NAME,
@@ -113,16 +140,61 @@ export = (app: Probot) => {
         head_sha: sha,
         output: FAILURE_OUTPUT,
       });
+      logger.metric('do_not_merge.add_label');
+    }
+  );
+
+  app.on(
+    [
+      'pull_request.opened',
+      'pull_request.reopened',
+      'pull_request.edited',
+      'pull_request.synchronize',
+    ],
+    async context => {
+      // Exit if the PR is closed.
+      if (context.payload.pull_request.state === 'closed') {
+        logger.info(
+          `The pull request ${context.payload.pull_request.url} is closed, exiting.`
+        );
+        return;
+      }
+      // If the head repo is null, we can not proceed.
+      if (
+        context.payload.pull_request.head.repo === undefined ||
+        context.payload.pull_request.head.repo === null
+      ) {
+        logger.info(
+          `The head repo is undefined for ${context.payload.pull_request.url}, exiting.`
+        );
+        return;
+      }
+      const {owner, repo} = context.repo();
+
+      // We should first check the config schema. Otherwise, we'll miss
+      // the opportunity for checking the schema when adding the config
+      // file for the first time.
+      const configChecker = new ConfigChecker<ConfigurationOptions>(
+        schema,
+        CONFIGURATION_FILE_PATH
+      );
+      await configChecker.validateConfigChanges(
+        context.octokit,
+        owner,
+        repo,
+        context.payload.pull_request.head.sha,
+        context.payload.pull_request.number
+      );
     }
   );
 };
 
 async function findCheck(
-  context: Context<Webhooks.EventPayloads.WebhookPayloadPullRequest>,
+  context: Context<'pull_request'>,
   owner: string,
   repo: string,
   sha: string
-): Promise<{id: number; conclusion: string} | undefined> {
+): Promise<{id: number; conclusion: string | null} | undefined> {
   const checks = (
     await context.octokit.checks.listForRef({
       owner,

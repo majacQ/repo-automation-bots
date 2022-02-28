@@ -16,7 +16,8 @@ import admin from 'firebase-admin';
 import {FirestoreConfigsStore} from '../../database';
 import {scanGithubForConfigs} from '../../handlers';
 import yargs = require('yargs');
-import {octokitFrom} from '../../octokit-util';
+import {octokitFactoryFrom} from '../../octokit-util';
+import {serve} from '../../serve';
 
 interface Args {
   'pem-path': string;
@@ -24,6 +25,8 @@ interface Args {
   installation: number;
   org: string;
   project: string;
+  port: number;
+  ignore: string[];
 }
 
 export const scanConfigs: yargs.CommandModule<{}, Args> = {
@@ -56,6 +59,20 @@ export const scanConfigs: yargs.CommandModule<{}, Args> = {
         describe: 'project with config database',
         type: 'string',
         demand: true,
+      })
+      .option('port', {
+        describe:
+          'run a webserver listening to this port.  Requests to /scan-configs ' +
+          'trigger actually scanning the configs.',
+        type: 'number',
+        demand: false,
+        default: 0,
+      })
+      .option('ignore', {
+        describe: 'names of repos to ignore',
+        type: 'array',
+        demand: false,
+        default: ['googleapis', 'googleapis-gen'],
       });
   },
   async handler(argv) {
@@ -64,13 +81,20 @@ export const scanConfigs: yargs.CommandModule<{}, Args> = {
       projectId: argv.project,
     });
     const db = admin.firestore();
-    const octokit = await octokitFrom(argv);
     const configStore = new FirestoreConfigsStore(db!);
-    await scanGithubForConfigs(
-      configStore,
-      octokit,
-      argv.org,
-      argv.installation
-    );
+    const invoke = () => {
+      return scanGithubForConfigs(
+        configStore,
+        octokitFactoryFrom(argv),
+        argv.org,
+        argv.installation,
+        argv.ignore
+      );
+    };
+    if (argv.port) {
+      await serve(argv.port, '/scan-configs', invoke);
+    } else {
+      await invoke();
+    }
   },
 };

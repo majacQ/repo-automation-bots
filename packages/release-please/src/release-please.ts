@@ -14,12 +14,6 @@
 
 // eslint-disable-next-line node/no-extraneous-import
 import {Probot} from 'probot';
-import {
-  ReleasePRFactoryOptions,
-  GitHubReleaseFactoryOptions,
-  ReleasePR,
-  factory,
-} from 'release-please';
 import {Runner} from './runner';
 // eslint-disable-next-line node/no-extraneous-import
 import {Octokit} from '@octokit/rest';
@@ -28,11 +22,26 @@ import {Octokit} from '@octokit/rest';
 // eslint-disable-next-line node/no-extraneous-import
 import {request} from '@octokit/request';
 import {logger} from 'gcf-utils';
+import {ConfigChecker, getConfig} from '@google-automations/bot-config-utils';
+import {syncLabels} from '@google-automations/label-utils';
 import {
+  Errors,
+  GitHub,
+  Manifest,
+  ManifestOptions,
   ReleaseType,
-  getReleaserNames,
-} from 'release-please/build/src/releasers';
-import {Manifest} from 'release-please/build/src/manifest';
+  ReleaserConfig,
+  getReleaserTypes,
+  setLogger,
+} from 'release-please';
+import schema from './config-schema.json';
+import {
+  BranchConfiguration,
+  ConfigurationOptions,
+  WELL_KNOWN_CONFIGURATION_FILE,
+  DEFAULT_CONFIGURATION,
+} from './config-constants';
+import {FORCE_RUN_LABEL, RELEASE_PLEASE_LABELS} from './labels';
 type RequestBuilderType = typeof request;
 type DefaultFunctionType = RequestBuilderType['defaults'];
 type RequestFunctionType = ReturnType<DefaultFunctionType>;
@@ -43,36 +52,6 @@ interface GitHubAPI {
   graphql: Function;
   request: RequestFunctionType;
 }
-
-interface BranchOptions {
-  releaseLabels?: string[];
-  monorepoTags?: boolean;
-  releaseType?: ReleaseType;
-  packageName?: string;
-  handleGHRelease?: boolean;
-  bumpMinorPreMajor?: boolean;
-  path?: string;
-  changelogPath?: string;
-  manifest?: boolean;
-}
-
-interface BranchConfiguration extends BranchOptions {
-  branch: string;
-}
-
-interface ConfigurationOptions extends BranchOptions {
-  primaryBranch: string;
-  branches?: BranchConfiguration[];
-}
-
-const DEFAULT_API_URL = 'https://api.github.com';
-const WELL_KNOWN_CONFIGURATION_FILE = 'release-please.yml';
-const DEFAULT_CONFIGURATION: ConfigurationOptions = {
-  primaryBranch: 'master',
-  branches: [],
-  manifest: false,
-};
-const FORCE_RUN_LABEL = 'release-please:force-run';
 
 function releaseTypeFromRepoLanguage(language: string | null): ReleaseType {
   if (language === null) {
@@ -89,8 +68,8 @@ function releaseTypeFromRepoLanguage(language: string | null): ReleaseType {
     case 'go':
       return 'go-yoshi';
     default: {
-      const releasers = getReleaserNames();
-      if (releasers.includes(language.toLowerCase())) {
+      const releasers = getReleaserTypes();
+      if (releasers.includes(language.toLowerCase() as ReleaseType)) {
         return language.toLowerCase() as ReleaseType;
       } else {
         throw Error(`unknown release type: ${language}`);
@@ -102,116 +81,162 @@ function releaseTypeFromRepoLanguage(language: string | null): ReleaseType {
 function findBranchConfiguration(
   branch: string,
   config: ConfigurationOptions
-): BranchConfiguration | null {
+): BranchConfiguration[] {
+  const configurations: BranchConfiguration[] = [];
+
   // look at primaryBranch first
   if (branch === config.primaryBranch) {
-    return {
+    configurations.push({
       ...config,
       ...{branch},
-    };
+    });
   }
 
-  if (!config.branches) {
-    return null;
+  if (config.branches) {
+    for (const branchConfig of config.branches) {
+      if (branch === branchConfig.branch) {
+        configurations.push(branchConfig);
+      }
+    }
   }
 
-  const found = config.branches.find(branchConfig => {
-    return branch === branchConfig.branch;
-  });
-  if (found) {
-    return found;
-  }
-
-  return null;
+  return configurations;
 }
 
-// turn a merged release-please release PR into a GitHub release.
-async function createGitHubRelease(
-  packageName: string,
-  repoUrl: string,
-  configuration: BranchConfiguration,
-  github: GitHubAPI
+/**
+ * Returns the repository's default/primary branch.
+ *
+ * @param {string} owner owner portion of GitHub repo URL.
+ * @param {string} repo repo portion of GitHub repo URL.
+ * @param {object} octokit authenticated Octokit instance.
+ * @returns {string}
+ */
+async function getRepositoryDefaultBranch(
+  owner: string,
+  repo: string,
+  octokit: OctokitType
 ) {
-  const releaseOptions: GitHubReleaseFactoryOptions = {
-    label: 'autorelease: pending',
-    repoUrl,
-    packageName,
-    apiUrl: DEFAULT_API_URL,
-    octokitAPIs: {
-      octokit: (github as {}) as OctokitType,
-      graphql: github.graphql,
-      request: github.request,
-    },
-    path: configuration.path,
-    changelogPath: configuration.changelogPath ?? 'CHANGELOG.md',
-    monorepoTags: configuration.monorepoTags,
-    releaseType: configuration.releaseType,
-  };
-  if (configuration.manifest) {
-    const manifest = factory.manifest(releaseOptions);
-    await Runner.manifestRelease(manifest);
-  } else {
-    const ghr = factory.githubRelease(releaseOptions);
-    await Runner.releaser(ghr);
-  }
+  const {data} = await octokit.repos.get({
+    owner,
+    repo,
+  });
+  return (
+    data as {
+      default_branch: string;
+    }
+  ).default_branch;
 }
 
-async function createReleasePR(
-  repoName: string,
-  repoUrl: string,
+/**
+ * Returns the repository's default/primary branch.
+ *
+ * @param {string} owner owner portion of GitHub repo URL.
+ * @param {string} repo repo portion of GitHub repo URL.
+ * @param {object} octokit authenticated Octokit instance.
+ * @returns {string}
+ */
+async function getConfigWithDefaultBranch(
+  owner: string,
+  repo: string,
+  octokit: OctokitType,
+  defaultBranch?: string
+): Promise<ConfigurationOptions | null> {
+  const config = await getConfig<ConfigurationOptions>(
+    octokit,
+    owner,
+    repo,
+    WELL_KNOWN_CONFIGURATION_FILE,
+    {schema: schema}
+  );
+  if (config && !config.primaryBranch) {
+    config.primaryBranch =
+      defaultBranch || (await getRepositoryDefaultBranch(owner, repo, octokit));
+  }
+  return config;
+}
+
+async function buildGitHub(
+  owner: string,
+  repo: string,
+  octokit: GitHubAPI,
+  defaultBranch?: string
+): Promise<GitHub> {
+  return await GitHub.create({
+    owner,
+    repo,
+    defaultBranch,
+    octokitAPIs: {
+      octokit: octokit as {} as OctokitType,
+      request: octokit.request,
+      graphql: octokit.graphql,
+    },
+  });
+}
+
+async function buildManifest(
+  github: GitHub,
   repoLanguage: string | null,
-  configuration: BranchConfiguration,
-  github: GitHubAPI,
-  snapshot?: boolean
-): Promise<ReleasePR | Manifest> {
+  configuration: BranchConfiguration
+): Promise<Manifest> {
+  if (configuration.manifest) {
+    logger.info('building from manifest file');
+    return await Manifest.fromManifest(
+      github,
+      configuration.branch,
+      configuration.manifestConfig,
+      configuration.manifestFile
+    );
+  }
+
   const releaseType = configuration.releaseType
     ? configuration.releaseType
+    : configuration.manifest
+    ? 'simple'
     : releaseTypeFromRepoLanguage(repoLanguage);
-  const packageName = configuration.packageName || repoName;
 
-  const buildOptions: ReleasePRFactoryOptions = {
-    defaultBranch: configuration.branch,
-    packageName,
-    repoUrl,
-    apiUrl: DEFAULT_API_URL,
-    octokitAPIs: {
-      octokit: (github as {}) as OctokitType,
-      graphql: github.graphql,
-      request: github.request,
-    },
-    bumpMinorPreMajor: configuration.bumpMinorPreMajor,
-    path: configuration.path,
-    monorepoTags: configuration.monorepoTags,
+  const releaserConfig: ReleaserConfig = {
     releaseType,
+    versioning: configuration.versioning,
+    bumpMinorPreMajor: configuration.bumpMinorPreMajor,
+    bumpPatchForMinorPreMajor: configuration.bumpPatchForMinorPreMajor,
+    draft: configuration.draft,
+    draftPullRequest: configuration.draftPullRequest,
+    packageName: configuration.packageName,
+    includeComponentInTag: !!configuration.monorepoTags,
+    pullRequestTitlePattern: configuration.pullRequestTitlePattern,
+    // changelogSections: configuration.changelogSections,
+    changelogPath: configuration.changelogPath,
+    changelogType: configuration.changelogType,
+    versionFile: configuration.versionFile,
+    extraFiles: configuration.extraFiles,
   };
-  if (snapshot !== undefined) {
-    buildOptions.snapshot = snapshot;
-  }
-  if (configuration.releaseLabels) {
-    buildOptions.label = configuration.releaseLabels.join(',');
-  }
-
-  if (configuration.manifest) {
-    const manifest = factory.manifest(buildOptions);
-    await Runner.manifest(manifest);
-    return manifest;
-  } else {
-    const releasePR = factory.releasePR(buildOptions);
-    await Runner.runner(releasePR);
-    return releasePR;
-  }
+  const manifestOverrides: ManifestOptions = {
+    manifestPath: configuration.manifestFile,
+    labels: configuration.releaseLabels,
+    releaseLabels: configuration.releaseLabel?.split(','),
+  };
+  return await Manifest.fromConfig(
+    github,
+    configuration.branch,
+    releaserConfig,
+    manifestOverrides,
+    configuration.path
+  );
 }
 
-export = (app: Probot) => {
+const handler = (app: Probot) => {
   app.on('push', async context => {
     const repoUrl = context.payload.repository.full_name;
     const branch = context.payload.ref.replace('refs/heads/', '');
-    const repoName = context.payload.repository.name;
     const repoLanguage = context.payload.repository.language;
+    const {owner, repo} = context.repo();
 
-    const remoteConfiguration: ConfigurationOptions | null = (await context.config(
-      WELL_KNOWN_CONFIGURATION_FILE
-    )) as ConfigurationOptions | null;
+    const remoteConfiguration = await getConfigWithDefaultBranch(
+      owner,
+      repo,
+      context.octokit,
+      context.payload.repository.default_branch
+    );
 
     // If no configuration is specified,
     if (!remoteConfiguration) {
@@ -224,32 +249,74 @@ export = (app: Probot) => {
       ...remoteConfiguration,
     };
 
-    const branchConfiguration = findBranchConfiguration(branch, configuration);
-    if (!branchConfiguration) {
-      logger.info(`Did not find configuration for branch: ${branch}`);
+    // use gcf-logger as logger for release-please
+    setLogger(logger);
+
+    logger.info(`push (${repoUrl}, ${branch})`);
+    const branchConfigurations = findBranchConfiguration(branch, configuration);
+
+    if (branchConfigurations.length === 0) {
+      logger.info(`no configuration for (${repoUrl}, ${branch})`);
       return;
     }
 
-    logger.info(`push (${repoUrl})`);
-    await createReleasePR(
-      repoName,
-      repoUrl,
-      repoLanguage,
-      branchConfiguration,
+    const github = await buildGitHub(
+      owner,
+      repo,
       context.octokit as GitHubAPI,
-      undefined
+      context.payload.repository.default_branch
     );
 
-    // release-please can handle creating a release on GitHub, we opt not to do
-    // this for our repos that have autorelease enabled.
-    if (branchConfiguration.handleGHRelease) {
-      logger.info(`handling GitHub release for (${repoUrl})`);
-      await createGitHubRelease(
-        branchConfiguration.packageName ?? repoName,
-        repoUrl,
-        branchConfiguration,
-        context.octokit as GitHubAPI
+    for (const branchConfiguration of branchConfigurations) {
+      logger.debug(branchConfiguration);
+
+      let manifest = await buildManifest(
+        github,
+        repoLanguage,
+        branchConfiguration
       );
+
+      // release-please can handle creating a release on GitHub, we opt not to do
+      // this for our repos that have autorelease enabled.
+      if (branchConfiguration.handleGHRelease) {
+        logger.info(`handling GitHub release for (${repoUrl})`);
+        try {
+          const numReleases = await Runner.createReleases(manifest);
+          logger.info(`Created ${numReleases} releases`);
+          if (numReleases > 0) {
+            // we created a release, reload config which may include the latest
+            // version
+            manifest = await buildManifest(
+              github,
+              repoLanguage,
+              branchConfiguration
+            );
+          }
+        } catch (e) {
+          if (e instanceof Errors.DuplicateReleaseError) {
+            // In the future, this could raise an issue against the
+            // installed repository
+            logger.warn('Release tag already exists, skipping...', e);
+          } else {
+            throw e;
+          }
+        }
+      }
+
+      try {
+        logger.info(`creating pull request for (${repoUrl})`);
+        await Runner.createPullRequests(manifest);
+      } catch (e) {
+        if (e instanceof Errors.ConfigurationError) {
+          // In the future, this could raise an issue against the
+          // installed repository
+          logger.warn(e);
+          return;
+        } else {
+          // re-raise
+          throw e;
+        }
+      }
     }
   });
 
@@ -257,11 +324,14 @@ export = (app: Probot) => {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   app.on('schedule.repository' as any, async context => {
     const repoUrl = context.payload.repository.full_name;
-    const repoName = context.payload.repository.name;
+    const owner = context.payload.organization.login;
+    const repo = context.payload.repository.name;
 
-    const remoteConfiguration = (await context.config(
-      WELL_KNOWN_CONFIGURATION_FILE
-    )) as ConfigurationOptions | null;
+    const remoteConfiguration = await getConfigWithDefaultBranch(
+      owner,
+      repo,
+      context.octokit
+    );
 
     // If no configuration is specified,
     if (!remoteConfiguration) {
@@ -269,51 +339,16 @@ export = (app: Probot) => {
       return;
     }
 
-    const configuration = {
-      ...DEFAULT_CONFIGURATION,
-      ...remoteConfiguration,
-    };
-
-    logger.info(
-      `schedule.repository (${repoUrl}, ${configuration.primaryBranch})`
-    );
-    const defaultBranchConfiguration = {
-      ...configuration,
-      ...{branch: configuration.primaryBranch},
-    };
-
-    // get the repository language
-    const repository = await context.octokit.repos.get(context.repo());
-    const repoLanguage = repository.data.language;
-
-    await createReleasePR(
-      repoName,
-      repoUrl,
-      repoLanguage,
-      defaultBranchConfiguration,
-      context.octokit,
-      true
-    );
-
-    if (!configuration.branches) {
-      return;
+    // syncLabels is just a nice to have feature, so we ignore all the
+    // errors and continue. If this strategy becomes problematic, we
+    // can create another scheduler job.
+    try {
+      await syncLabels(context.octokit, owner, repo, RELEASE_PLEASE_LABELS);
+    } catch (e) {
+      const err = e as Error;
+      err.message = `Failed to sync the labels: ${err.message}`;
+      logger.error(err);
     }
-
-    await Promise.all(
-      configuration.branches.map(branchConfiguration => {
-        logger.info(
-          `schedule.repository (${repoUrl}, ${branchConfiguration.branch})`
-        );
-        return createReleasePR(
-          repoName,
-          repoUrl,
-          repoLanguage,
-          branchConfiguration,
-          context.octokit,
-          true
-        );
-      })
-    );
   });
 
   app.on('pull_request.labeled', async context => {
@@ -326,9 +361,11 @@ export = (app: Probot) => {
       )
     ) {
       logger.info(
-        `ignoring non-force label action (${context.payload.pull_request.labels.join(
-          ', '
-        )})`
+        `ignoring non-force label action (${context.payload.pull_request.labels
+          .map(label => {
+            return label.name;
+          })
+          .join(', ')})`
       );
       return;
     }
@@ -337,7 +374,6 @@ export = (app: Probot) => {
     const owner = context.payload.repository.owner.login;
     const repo = context.payload.repository.name;
     const branch = context.payload.pull_request.base.ref;
-    const repoName = context.payload.repository.name;
     const repoLanguage = context.payload.repository.language;
 
     // remove the label
@@ -349,9 +385,12 @@ export = (app: Probot) => {
     });
 
     // check release please config
-    const remoteConfiguration = (await context.config(
-      WELL_KNOWN_CONFIGURATION_FILE
-    )) as ConfigurationOptions | null;
+    const remoteConfiguration = await getConfigWithDefaultBranch(
+      owner,
+      repo,
+      context.octokit,
+      context.payload.repository.default_branch
+    );
 
     // If no configuration is specified,
     if (!remoteConfiguration) {
@@ -364,20 +403,157 @@ export = (app: Probot) => {
       ...remoteConfiguration,
     };
 
-    const branchConfiguration = findBranchConfiguration(branch, configuration);
-    if (!branchConfiguration) {
-      logger.info(`Did not find configuration for branch: ${branch}`);
+    logger.info(`pull_request.labeled (${repoUrl}, ${branch})`);
+    const branchConfigurations = findBranchConfiguration(branch, configuration);
+    if (branchConfigurations.length === 0) {
+      logger.info(`no configuration for (${repoUrl}, ${branch})`);
       return;
     }
 
-    logger.info(`pull_request.labeled (${repoUrl})`);
-    await createReleasePR(
-      repoName,
-      repoUrl,
-      repoLanguage,
-      branchConfiguration,
+    const github = await buildGitHub(
+      owner,
+      repo,
       context.octokit as GitHubAPI,
-      undefined
+      context.payload.repository.default_branch
+    );
+
+    for (const branchConfiguration of branchConfigurations) {
+      logger.debug(branchConfiguration);
+      const manifest = await buildManifest(
+        github,
+        repoLanguage,
+        branchConfiguration
+      );
+      await Runner.createPullRequests(manifest);
+    }
+  });
+
+  app.on('release.created', async context => {
+    const repoUrl = context.payload.repository.full_name;
+    const {owner, repo} = context.repo();
+    const remoteConfiguration = await getConfig<ConfigurationOptions>(
+      context.octokit,
+      owner,
+      repo,
+      WELL_KNOWN_CONFIGURATION_FILE,
+      {schema: schema}
+    );
+
+    // If no configuration is specified,
+    if (!remoteConfiguration) {
+      logger.info(`release-please not configured for (${repoUrl})`);
+      return;
+    }
+
+    // Releases are still currently handled by autorelease, we hook into the
+    // release.created webhook just to log this metric:
+    logger.metric('release_please.release_created', {
+      url: context.payload.repository.releases_url,
+    });
+  });
+  // Check the config schema on PRs.
+  app.on(['pull_request.opened', 'pull_request.synchronize'], async context => {
+    const configChecker = new ConfigChecker<ConfigurationOptions>(
+      schema,
+      WELL_KNOWN_CONFIGURATION_FILE
+    );
+    const {owner, repo} = context.repo();
+    await configChecker.validateConfigChanges(
+      context.octokit,
+      owner,
+      repo,
+      context.payload.pull_request.head.sha,
+      context.payload.pull_request.number
     );
   });
+
+  // If a release PR is closed unmerged, label with autorelease: closed
+  app.on('pull_request.closed', async context => {
+    const repoUrl = context.payload.repository.full_name;
+    const {owner, repo} = context.repo();
+    const remoteConfiguration = await getConfig<ConfigurationOptions>(
+      context.octokit,
+      owner,
+      repo,
+      WELL_KNOWN_CONFIGURATION_FILE,
+      {schema: schema}
+    );
+
+    // If no configuration is specified,
+    if (!remoteConfiguration) {
+      logger.info(`release-please not configured for (${repoUrl})`);
+      return;
+    }
+
+    if (context.payload.pull_request.merged) {
+      logger.info('ignoring merged pull request');
+      return;
+    }
+
+    if (
+      context.payload.pull_request.labels.some(label => {
+        return label.name === 'autorelease: pending';
+      })
+    ) {
+      await Promise.all([
+        context.octokit.issues.removeLabel(
+          context.repo({
+            issue_number: context.payload.pull_request.number,
+            name: 'autorelease: pending',
+          })
+        ),
+        context.octokit.issues.addLabels(
+          context.repo({
+            issue_number: context.payload.pull_request.number,
+            labels: ['autorelease: closed'],
+          })
+        ),
+      ]);
+    }
+  });
+
+  // If a closed release PR is reopened, re-label with autorelease: pending
+  app.on('pull_request.reopened', async context => {
+    const repoUrl = context.payload.repository.full_name;
+    const {owner, repo} = context.repo();
+    const remoteConfiguration = await getConfig<ConfigurationOptions>(
+      context.octokit,
+      owner,
+      repo,
+      WELL_KNOWN_CONFIGURATION_FILE,
+      {schema: schema}
+    );
+
+    // If no configuration is specified,
+    if (!remoteConfiguration) {
+      logger.info(`release-please not configured for (${repoUrl})`);
+      return;
+    }
+
+    if (
+      context.payload.pull_request.labels.some(label => {
+        return label.name === 'autorelease: closed';
+      })
+    ) {
+      await Promise.all([
+        context.octokit.issues.removeLabel(
+          context.repo({
+            issue_number: context.payload.pull_request.number,
+            name: 'autorelease: closed',
+          })
+        ),
+        context.octokit.issues.addLabels(
+          context.repo({
+            issue_number: context.payload.pull_request.number,
+            labels: ['autorelease: pending'],
+          })
+        ),
+      ]);
+    }
+  });
+};
+
+export const api = {
+  handler,
+  getRepositoryDefaultBranch,
 };

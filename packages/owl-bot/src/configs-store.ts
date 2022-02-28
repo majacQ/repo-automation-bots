@@ -12,20 +12,46 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import {OwlBotLock, OwlBotYaml} from './config-files';
+import {
+  OwlBotLock,
+  owlBotLockFrom,
+  OWL_BOT_LOCK_PATH,
+  OwlBotYaml,
+  owlBotYamlFromText,
+  InvalidOwlBotConfigError,
+} from './config-files';
 import {GithubRepo} from './github-repo';
+import * as fs from 'fs';
+import path from 'path';
+import {load} from 'js-yaml';
+import {glob} from 'glob';
+
+export interface OwlBotYamlAndPath {
+  // The path in the repository where the .OwlBot.yaml was found.
+  path: string;
+  // The contents of the .OwlBot.yaml.
+  yaml: OwlBotYaml;
+}
 
 export interface Configs {
-  // The body of .Owlbot.lock.yaml.
   lock?: OwlBotLock;
   // The body of .Owlbot.yaml.
-  yaml?: OwlBotYaml;
+  yamls?: OwlBotYamlAndPath[];
   // The commit hash from which the config files were retrieved.
   commitHash: string;
   // The branch name from which the config files were retrieved.
   branchName: string;
   // The installation id for our github app and this repo.
   installationId: number;
+}
+
+/**
+ * A repo affected by a change and the path to .OwlBot.yaml
+ */
+export interface AffectedRepo {
+  repo: GithubRepo;
+  // path to .OwlBot.yaml
+  yamlPath: string;
 }
 
 export interface ConfigsStore {
@@ -52,6 +78,12 @@ export interface ConfigsStore {
   ): Promise<boolean>;
 
   /**
+   * Removes configuration files contents into the database.
+   * @param repo full repo name like "googleapis/nodejs-vision"
+   */
+  clearConfigs(repo: string): Promise<void>;
+
+  /**
    * Finds repos with their docker.image set to dockerImaegname in their
    * .OwlBot.lock.yaml files.
    * @param dockerImageName the name of the post-processore docker image
@@ -62,31 +94,29 @@ export interface ConfigsStore {
   ): Promise<[string, Configs][]>;
 
   /**
-   * Finds a previously recorded pull request or returns undefined.
+   * Finds a previously recorded cloud build id or returns undefined.
    * @param repo full repo name like "googleapis/nodejs-vision"
    * @param lock The new contents of the lock file.
    * @returns the string passed to recordPullRequestForUpdatingLock().
    */
-  findPullRequestForUpdatingLock(
+  findBuildIdForUpdatingLock(
     repo: string,
     lock: OwlBotLock
   ): Promise<string | undefined>;
 
   /**
-   * Records a pull request created to update the lock file.
+   * Records a cloud build id created to update the lock file.
    * @param repo full repo name like "googleapis/nodejs-vision"
    * @param lock The new contents of the lock file.
-   * @param pullRequestId the string that will be later returned by
-   *  findPullRequestForUpdatingLock().
-   * @returns pullRequestId, which may differ from the argument if there
+   * @param buildIdId the string that will be later returned by
+   *  findBuildIdForUpdatingLock().
+   * @returns buildId, which may differ from the argument if there
    *   already was a pull request recorded.
-   *   In that case, the caller should close the pull request they
-   *   created, to avoid annoying maintainers with duplicate pull requests.
    */
-  recordPullRequestForUpdatingLock(
+  recordBuildIdForUpdatingLock(
     repo: string,
     lock: OwlBotLock,
-    pullRequestId: string
+    buildId: string
   ): Promise<string>;
 
   /**
@@ -99,5 +129,55 @@ export interface ConfigsStore {
    */
   findReposAffectedByFileChanges(
     changedFilePaths: string[]
-  ): Promise<GithubRepo[]>;
+  ): Promise<AffectedRepo[]>;
+}
+
+export interface CollectedConfigs {
+  lock?: OwlBotLock;
+  yamls: OwlBotYamlAndPath[];
+  badConfigs: {path: string; errorMessages: string[]}[];
+}
+
+/**
+ * Examines the contents of a local repo directory and collects owl bot config
+ * files.
+ */
+export function collectConfigs(dir: string): CollectedConfigs {
+  const configs: CollectedConfigs = {
+    yamls: [],
+    badConfigs: [],
+  };
+  // .OwlBot.lock.yaml is always in a known location.
+  const lockPath = path.join(dir, OWL_BOT_LOCK_PATH);
+  if (fs.existsSync(lockPath)) {
+    try {
+      const lockText = fs.readFileSync(lockPath, 'utf8');
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const lockYaml = load(lockText) as Record<string, any>;
+      configs.lock = owlBotLockFrom(lockYaml);
+    } catch (e) {
+      const errorMessages = e instanceof Error ? [e.toString()] : [String(e)];
+      configs.badConfigs.push({path: OWL_BOT_LOCK_PATH, errorMessages});
+    }
+  }
+  // .OwlBot.yamls may be scattered throughout the directory.  Find them.
+  const yamlPaths = glob.sync(path.join('**', '.OwlBot.yaml'), {cwd: dir});
+  // Glob ignores .dot files, and we need to look in the .github directory.
+  yamlPaths.push(
+    ...glob.sync(path.join('.github', '**', '.OwlBot.yaml'), {cwd: dir})
+  );
+  for (const yamlPath of yamlPaths) {
+    try {
+      const yamlText = fs.readFileSync(path.join(dir, yamlPath), 'utf8');
+      configs.yamls.push({
+        path: yamlPath,
+        yaml: owlBotYamlFromText(yamlText),
+      });
+    } catch (e) {
+      const errorMessages =
+        e instanceof InvalidOwlBotConfigError ? e.errorMessages : [String(e)];
+      configs.badConfigs.push({path: yamlPath, errorMessages});
+    }
+  }
+  return configs;
 }

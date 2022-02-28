@@ -6,6 +6,16 @@
       "color": "00ff00"
     },
     {
+      "name": "api: N/A",
+      "description": "Tells auto-label to not auto-detect the API for this issue",
+      "color": "#6950f6"
+    },
+    {
+      "name": "eol",
+      "description": "End of life. Deprecating support for a previous version.",
+      "color": "c9abb2"
+    },
+    {
       "name": "status: blocked",
       "description": "Resolving the issue is dependent on other work.",
       "color": "f9d0c4"
@@ -131,6 +141,11 @@
       "color": "C1FFB2"
     },
     {
+      "name": "owlbot:run",
+      "description": "Add this label to trigger the Owlbot post processor.",
+      "color": "84D2D4"
+    },
+    {
       "name": "cla: yes",
       "description": "This human has signed the Contributor License Agreement.",
       "color": "0B7601"
@@ -169,6 +184,11 @@
       "name": "flakybot: quiet",
       "description": "Tells the Flaky Bot to comment less.",
       "color": "86d9d7"
+    },
+    {
+      "name": "next major: breaking change",
+      "description": "this is a change that we should wait to bundle into the next major version",
+      "color": "b5e67b"
     },
     {
       "name": "samples",
@@ -219,6 +239,16 @@
       "name": "lang: go",
       "description": "Issues specific to Go.",
       "color": "2fe0da"
+    },
+    {
+      "name": "stale: old",
+      "description": "Pull request is old and needs attention.",
+      "color": "ab270b"
+    },
+    {
+      "name": "stale: extraold",
+      "description": "Pull request is critically old and needs prioritization.",
+      "color": "801904"
     }
   ]
 }

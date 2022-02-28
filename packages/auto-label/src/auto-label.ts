@@ -17,29 +17,29 @@ import {Storage} from '@google-cloud/storage';
 import {Probot, Context} from 'probot';
 import {logger} from 'gcf-utils';
 import * as helper from './helper';
-import {DriftRepo, DriftApi, Label, Config} from './helper';
+import {
+  CONFIG_FILE_NAME,
+  DEFAULT_CONFIGS,
+  LABEL_PRODUCT_BY_DEFAULT,
+  DriftRepo,
+  DriftApi,
+  Label,
+  Config,
+} from './helper';
+import schema from './config-schema.json';
 import {Endpoints} from '@octokit/types';
+import {
+  ConfigChecker,
+  getConfigWithDefault,
+} from '@google-automations/bot-config-utils';
+import {syncLabels} from '@google-automations/label-utils';
 
+// This is a label that, when applied to an issue, keeps auto-label
+// from attempting to autodetect a label. This is helpful if there's an
+// issue that would get labeled incorrectly by the auto-detector, and has
+// no corresponding product from its repo.
+const API_NA_LABEL = 'api: N/A';
 type IssueResponse = Endpoints['GET /repos/{owner}/{repo}/issues']['response'];
-type ConfigResponse = Endpoints['GET /repos/{owner}/{repo}/contents/{path}']['response'];
-
-// Default app configs if user didn't specify a .config
-const LABEL_PRODUCT_BY_DEFAULT = true;
-const DEFAULT_CONFIGS = {
-  product: LABEL_PRODUCT_BY_DEFAULT,
-  language: {
-    pullrequest: false,
-  },
-  path: {
-    pullrequest: false,
-  },
-};
-
-interface File {
-  content: string | undefined;
-}
-
-import colorsData from './colors.json';
 
 const storage = new Storage();
 
@@ -77,7 +77,7 @@ handler.addLabeltoRepoAndIssue = async function addLabeltoRepoAndIssue(
   issueNumber: number,
   issueTitle: string,
   driftRepos: DriftRepo[],
-  context: Context
+  context: Context<'pull_request'> | Context<'issues'> | Context<'installation'>
 ) {
   const driftRepo = driftRepos.find(x => x.repo === `${owner}/${repo}`);
   const res = await context.octokit.issues
@@ -96,34 +96,23 @@ handler.addLabeltoRepoAndIssue = async function addLabeltoRepoAndIssue(
       `There was no configured match for the repo ${repo}, trying to auto-detect the right label`
     );
     const apis = await handler.getDriftApis();
+    if (labelsOnIssue && labelsOnIssue?.find(x => x.name === API_NA_LABEL)) {
+      logger.info(
+        `${owner}/${repo}/${issueNumber} is marked as not applicable, skipping`
+      );
+      return;
+    }
     autoDetectedLabel = helper.autoDetectLabel(apis, issueTitle);
   }
-  const index = driftRepos?.findIndex(r => driftRepo === r) % colorsData.length;
-  const colorNumber = index >= 0 ? index : 0;
   const githubLabel = driftRepo?.github_label || autoDetectedLabel;
 
   if (githubLabel) {
-    try {
-      await context.octokit.issues.createLabel({
-        owner,
-        repo,
-        name: githubLabel,
-        color: colorsData[colorNumber].color,
-      });
-      logger.info(`Label added to ${owner}/${repo} is ${githubLabel}`);
-    } catch (e) {
-      // HTTP 422 means the label already exists on the repo
-      if (e.status !== 422) {
-        e.message = `Error creating label: ${e.message}`;
-        logger.error(e);
-      }
-    }
     if (labelsOnIssue) {
       const foundAPIName = helper.labelExists(labelsOnIssue, githubLabel);
 
       const cleanUpOtherLabels = labelsOnIssue.filter(
         (element: Label) =>
-          element.name.startsWith('api') &&
+          element.name?.startsWith('api') &&
           element.name !== foundAPIName?.name &&
           element.name !== autoDetectedLabel
       );
@@ -166,6 +155,13 @@ handler.addLabeltoRepoAndIssue = async function addLabeltoRepoAndIssue(
       wasNotAdded = false;
     }
   }
+  if (!wasNotAdded) {
+    if (driftRepo?.github_label) {
+      logger.metric('auto-label.label-added', {mode: 'repo-config'});
+    } else if (autoDetectedLabel) {
+      logger.metric('auto-label.label-added', {mode: 'autodetect'});
+    }
+  }
 
   let foundSamplesTag: Label | undefined;
   if (labelsOnIssue) {
@@ -174,14 +170,6 @@ handler.addLabeltoRepoAndIssue = async function addLabeltoRepoAndIssue(
   const isSampleIssue =
     repo.includes('samples') || issueTitle?.includes('sample');
   if (!foundSamplesTag && isSampleIssue) {
-    await context.octokit.issues
-      .createLabel({
-        owner,
-        repo,
-        name: 'samples',
-        color: colorsData[colorNumber].color,
-      })
-      .catch(logger.error);
     await context.octokit.issues
       .addLabels({
         owner,
@@ -193,14 +181,260 @@ handler.addLabeltoRepoAndIssue = async function addLabeltoRepoAndIssue(
     logger.info(
       `Issue ${issueNumber} is in a samples repo but does not have a sample tag, adding it to the repo and issue`
     );
+    logger.metric('auto-label.label-added', {mode: 'samples'});
     wasNotAdded = false;
   }
 
   return wasNotAdded;
 };
 
-function isFile(file: File | unknown): file is File {
-  return (file as File).content !== undefined;
+// Main job for PRs.
+handler.autoLabelOnPR = async function autoLabelOnPR(
+  context: Context<'pull_request'>,
+  owner: string,
+  repo: string,
+  config: Config
+) {
+  if (config?.enabled === false) {
+    logger.info(`Skipping for ${owner}/${repo}`);
+    return;
+  }
+  const pull_number = context.payload.pull_request.number;
+
+  if (config?.product) {
+    const driftRepos = await handler.getDriftRepos();
+    if (!driftRepos) {
+      return;
+    }
+    await handler.addLabeltoRepoAndIssue(
+      owner,
+      repo,
+      pull_number,
+      context.payload.pull_request.title,
+      driftRepos,
+      context
+    );
+  }
+
+  // Only need to fetch PR contents if config.path or config.language are configured.
+  if (!config?.path?.pullrequest && !config?.language?.pullrequest) {
+    return;
+  }
+
+  const filesChanged = await context.octokit.pulls.listFiles({
+    owner,
+    repo,
+    pull_number,
+  });
+  const labels = context.payload.pull_request.labels;
+  const new_labels = [];
+
+  // If user has turned on path labels by configuring {path: {pullrequest: false, }}
+  // By default, this feature is turned off
+  if (config.path?.pullrequest) {
+    logger.info(`Labeling path in PR #${pull_number} in ${owner}/${repo}...`);
+    const path_label = helper.getLabel(filesChanged.data, config.path, 'path');
+    if (path_label && !helper.labelExists(labels, path_label)) {
+      logger.info(
+        `Path label added to PR #${pull_number} in ${owner}/${repo} is ${path_label}`
+      );
+      new_labels.push(path_label);
+    }
+  }
+
+  // If user has turned on language labels by configuring {language: {pullrequest: false,}}
+  // By default, this feature is turned off
+  if (config.language?.pullrequest) {
+    logger.info(
+      `Labeling language in PR #${pull_number} in ${owner}/${repo}...`
+    );
+    const language_label = helper.getLabel(
+      filesChanged.data,
+      config.language,
+      'language'
+    );
+    if (language_label && !helper.labelExists(labels, language_label)) {
+      logger.info(
+        `Language label added to PR #${pull_number} in ${owner}/${repo} is ${language_label}`
+      );
+      new_labels.push(language_label);
+    }
+  }
+
+  // Update all labels gathered so far if any
+  if (new_labels.length) {
+    logger.info(
+      `Labels added to PR# ${pull_number} in ${owner}/${repo} are ${JSON.stringify(
+        new_labels
+      )}`
+    );
+    await context.octokit.issues.addLabels({
+      owner,
+      repo,
+      issue_number: pull_number,
+      labels: new_labels,
+    });
+  }
+};
+
+/**
+ * Function updating a stale label on pull request based on configuration values.
+ * Removes previous staleness label if exists
+ */
+async function updateStalenessLabel(
+  context: Context<'pull_request'> | Context<'issues'>,
+  owner: string,
+  repo: string,
+  config: Config
+) {
+  // If user has turned on stale labels by configuring {staleness: {pullrequest: true, old: 60, extraold: 120}}
+  // By default, this feature is turned off
+  if (!config.staleness?.pullrequest) {
+    logger.info(`Staleness feature is disabled for ${owner}/${repo}...`);
+    return;
+  }
+
+  const old = config.staleness?.old || helper.DEFAULT_DAYS_TO_STALE;
+  const extraold =
+    config.staleness?.extraold || helper.DEFAULT_DAYS_TO_STALE * 2;
+
+  // Make sure that config is right and if not, set defaults
+  if (old > extraold || extraold > helper.MAX_DAYS || old <= 0) {
+    logger.info(
+      `The staleness config is wrong, old = ${old}, extraold = ${extraold}, bailing...`
+    );
+    return;
+  }
+  logger.info(
+    `Running staleness check for ${owner}/${repo}, config: old=${old}, extraold=${extraold}...`
+  );
+  for await (const response of context.octokit.paginate.iterator(
+    context.octokit.rest.issues.listForRepo,
+    {
+      owner: owner,
+      repo: repo,
+    }
+  )) {
+    if (!response || !response.data) {
+      logger.info(`No active PRs available in ${owner}/${repo}...`);
+      return;
+    }
+    for (const pull of response.data) {
+      // Skip all non-pull request issues
+      if (!pull.pull_request) {
+        continue;
+      }
+      logger.info(
+        `Checking staleness in PR #${pull.number} in ${owner}/${repo}...`
+      );
+      let label = null;
+      const staleLabel = helper.fetchLabelByPrefix(
+        pull.labels as Label[],
+        helper.STALE_PREFIX
+      );
+      if (helper.isExpiredByDays(pull.created_at, extraold)) {
+        label = `${helper.STALE_PREFIX} ${helper.EXTRAOLD_LABEL}`;
+      } else if (helper.isExpiredByDays(pull.created_at, old)) {
+        label = `${helper.STALE_PREFIX} ${helper.OLD_LABEL}`;
+      }
+      if (label && label !== staleLabel?.name) {
+        // We are going to update a label now, remove an old one if exists
+        if (staleLabel) {
+          logger.info(
+            `Deleting ${staleLabel} in ${owner}/${repo}/${pull.number}...`
+          );
+          context.octokit.issues.removeLabel({
+            owner,
+            repo,
+            issue_number: pull.number,
+            name: staleLabel.name,
+          });
+        }
+        logger.metric('auto-label.label-added', {
+          repo: `${owner}/${repo}/`,
+          number: pull.number,
+          label: label,
+          mode: 'staledetect',
+        });
+        logger.info(`Adding ${label} to ${owner}/${repo}/${pull.number}...`);
+        await context.octokit.issues.addLabels({
+          owner,
+          repo,
+          issue_number: pull.number,
+          labels: [label],
+        });
+      }
+    }
+  }
+}
+
+/**
+ * Function updating a T-shirt size label on pull request if configuration is enabled.
+ * Removes previous size label if exists
+ */
+async function updatePullRequestSizeLabel(
+  context: Context<'pull_request'>,
+  owner: string,
+  repo: string,
+  config: Config
+) {
+  const pull_number = context.payload.pull_request.number;
+  // Update pull request size label if user has turned on config, product and
+  // pull request size labels feature by configuring {requestsize: {enabled: true,}}
+  // By default, this feature is turned off
+  if (
+    !config?.product ||
+    config?.enabled === false ||
+    !config?.requestsize?.enabled
+  ) {
+    logger.info(
+      `Skipping pull request size calculations for PR#${pull_number} in ${owner}/${repo}`
+    );
+    return;
+  }
+  const filesChanged = await context.octokit.pulls.listFiles({
+    owner,
+    repo,
+    pull_number,
+  });
+  logger.info(
+    `Request size calculation in PR #${pull_number} in ${owner}/${repo}...`
+  );
+  let changes = 0;
+  filesChanged.data.forEach(item => {
+    changes += item.changes;
+  });
+  logger.info(
+    `Amount of changes in pull request ${pull_number} in ${owner}/${repo} is ${changes}`
+  );
+  const pr_size = `${helper.SIZE_PREFIX} ${helper.getPullRequestSize(changes)}`;
+  const size_label = helper.fetchLabelByPrefix(
+    context.payload.pull_request.labels,
+    helper.SIZE_PREFIX
+  );
+  if (pr_size !== size_label?.name) {
+    if (size_label) {
+      logger.info(
+        `Deleting ${size_label.name} in ${owner}/${repo}/${pull_number}...`
+      );
+      context.octokit.issues.removeLabel({
+        owner,
+        repo,
+        issue_number: pull_number,
+        name: size_label.name,
+      });
+    }
+    // Update the PR size label
+    logger.info(
+      `Request size label added to PR #${pull_number} in ${owner}/${repo}, label is "${pr_size}"`
+    );
+    await context.octokit.issues.addLabels({
+      owner,
+      repo,
+      issue_number: pull_number,
+      labels: [pr_size],
+    });
+  }
 }
 
 /**
@@ -209,19 +443,35 @@ function isFile(file: File | unknown): file is File {
 export function handler(app: Probot) {
   // Nightly cron that backfills and corrects api labels
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  app.on('schedule.repository' as '*', async context => {
-    const config: Config | null = await context.config(
-      'auto-label.yaml',
-      DEFAULT_CONFIGS
-    );
-
+  app.on('schedule.repository' as any, async context => {
     const owner = context.payload.organization.login;
     const repo = context.payload.repository.name;
+    const config = await getConfigWithDefault<Config>(
+      context.octokit,
+      owner,
+      repo,
+      CONFIG_FILE_NAME,
+      DEFAULT_CONFIGS,
+      {schema: schema}
+    );
 
     if (!config?.product || config?.enabled === false) {
       logger.info(`Skipping for ${owner}/${repo}`);
       return;
     }
+    // If the pull request size labeling enabled, update all labels in a repo
+    // We run it here since the scheduler runs once in a while, so we dont
+    // need to update labels on pull request change event
+    if (config?.requestsize?.enabled) {
+      await syncLabels(
+        context.octokit,
+        owner,
+        repo,
+        helper.PULL_REQUEST_SIZE_LABELS
+      );
+    }
+    // Update staleness labels on all pull requests in the repo
+    updateStalenessLabel(context, owner, repo, config);
 
     logger.info(`running for org ${context.payload.cron_org}`);
     if (context.payload.cron_org !== owner) {
@@ -271,12 +521,16 @@ export function handler(app: Probot) {
   // Labels issues with product labels.
   // By default, this is turned on without user configuration.
   app.on(['issues.opened', 'issues.reopened'], async context => {
-    const config = await context.config<Config>(
-      'auto-label.yaml',
-      DEFAULT_CONFIGS
-    );
     const owner = context.payload.repository.owner.login;
     const repo = context.payload.repository.name;
+    const config = await getConfigWithDefault<Config>(
+      context.octokit,
+      owner,
+      repo,
+      CONFIG_FILE_NAME,
+      DEFAULT_CONFIGS,
+      {schema: schema}
+    );
     const issueNumber = context.payload.issue.number;
 
     if (!config?.product || config?.enabled === false) {
@@ -301,92 +555,32 @@ export function handler(app: Probot) {
   // Labels pull requests with product, language, and/or path labels.
   // By default, product labels are turned on and language/path labels are
   // turned off.
-  app.on(['pull_request.opened'], async context => {
-    const config = await context.config<Config>(
-      'auto-label.yaml',
-      DEFAULT_CONFIGS
-    );
+  app.on(['pull_request.opened', 'pull_request.synchronize'], async context => {
     const owner = context.payload.repository.owner.login;
     const repo = context.payload.repository.name;
-
-    if (config?.enabled === false) {
-      logger.info(`Skipping for ${owner}/${repo}`);
-      return;
-    }
-    const pull_number = context.payload.pull_request.number;
-
-    if (config?.product) {
-      const driftRepos = await handler.getDriftRepos();
-      if (!driftRepos) {
-        return;
-      }
-      await handler.addLabeltoRepoAndIssue(
-        owner,
-        repo,
-        pull_number,
-        context.payload.pull_request.title,
-        driftRepos,
-        context
-      );
-    }
-
-    // Only need to fetch PR contents if config.path or config.language are configured.
-    if (!config?.path?.pullrequest && !config?.language?.pullrequest) {
-      return;
-    }
-
-    const filesChanged = await context.octokit.pulls.listFiles({
+    // First check the config schema for PR.
+    const configChecker = new ConfigChecker<Config>(schema, CONFIG_FILE_NAME);
+    await configChecker.validateConfigChanges(
+      context.octokit,
       owner,
       repo,
-      pull_number,
-    });
-    const labels = context.payload.pull_request.labels;
-
-    // If user has turned on path labels by configuring {path: {pullrequest: false, }}
-    // By default, this feature is turned off
-    if (config.path?.pullrequest) {
-      logger.info(`Labeling path in PR #${pull_number} in ${owner}/${repo}...`);
-      const path_label = helper.getLabel(
-        filesChanged.data,
-        config.path,
-        'path'
-      );
-      if (path_label && !helper.labelExists(labels, path_label)) {
-        logger.info(
-          `Path label added to PR #${pull_number} in ${owner}/${repo} is ${path_label}`
-        );
-        await context.octokit.issues.addLabels({
-          owner,
-          repo,
-          issue_number: pull_number,
-          labels: [path_label],
-        });
-      }
+      context.payload.pull_request.head.sha,
+      context.payload.pull_request.number
+    );
+    const config = await getConfigWithDefault<Config>(
+      context.octokit,
+      owner,
+      repo,
+      CONFIG_FILE_NAME,
+      DEFAULT_CONFIGS,
+      {schema: schema}
+    );
+    await updatePullRequestSizeLabel(context, owner, repo, config);
+    // For the auto label main logic, synchronize event is irrelevant.
+    if (context.payload.action === 'synchronize') {
+      return;
     }
-
-    // If user has turned on language labels by configuring {language: {pullrequest: false,}}
-    // By default, this feature is turned off
-    if (config.language?.pullrequest) {
-      logger.info(
-        `Labeling language in PR #${pull_number} in ${owner}/${repo}...`
-      );
-      const language_label = helper.getLabel(
-        filesChanged.data,
-        config.language,
-        'language'
-      );
-      if (language_label && !helper.labelExists(labels, language_label)) {
-        logger.info(
-          `Language label added to PR #${pull_number} in ${owner}/${repo} is ${language_label}`
-        );
-        await context.octokit.issues.addLabels({
-          owner,
-          repo,
-          issue_number: pull_number,
-          labels: [language_label],
-        });
-      }
-    }
+    await handler.autoLabelOnPR(context, owner, repo, config);
   });
 
   app.on(['installation.created'], async context => {
@@ -395,33 +589,24 @@ export function handler(app: Probot) {
     if (!LABEL_PRODUCT_BY_DEFAULT) return;
     if (!driftRepos) return;
 
+    if (!repositories) {
+      logger.info('repositories is undefined, exiting');
+      return;
+    }
+
     for await (const repository of repositories) {
       const [owner, repo] = repository.full_name.split('/');
 
-      // Looks for a config file, breaks if user disabled product labels
-      let response;
-      try {
-        response = await context.octokit.repos.getContent({
-          owner,
-          repo,
-          path: '.github/auto-label.yaml',
-        });
-      } catch (e) {
-        e.message = `No auto-label.yaml found in repo upon installation: ${e.message}`;
-        logger.info(e);
-      }
-
-      if (response && response.status === 200) {
-        const config_encoded = response.data as ConfigResponse['data'];
-        if (isFile(config_encoded)) {
-          const config = Buffer.from(config_encoded.content, 'base64')
-            .toString('binary')
-            .toLowerCase();
-          const disable_product_label = config
-            .split('\n')
-            .filter(line => line.match(/^product:( *)false/));
-          if (disable_product_label.length > 0) break;
-        }
+      const config = await getConfigWithDefault<Config>(
+        context.octokit,
+        owner,
+        repo,
+        CONFIG_FILE_NAME,
+        DEFAULT_CONFIGS,
+        {schema: schema}
+      );
+      if (!config?.product) {
+        break;
       }
 
       // goes through issues in repository, adds labels as necessary

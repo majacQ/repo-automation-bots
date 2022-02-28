@@ -22,7 +22,7 @@
 # Optional arguments.
 #
 # BUILD_TARGETS: Build targets to rebuild.  Example: 
-#   //google/cloud/vision/v1:vision-v1-nodejs.tar.gz
+#   //google/cloud/vision/v1:vision-v1-nodejs
 #
 # BAZEL_FLAGS: additional flags to pass to 'bazel query' and 'bazel build'.
 # Useful for setting a remote cache, coping with different versions of bazel, etc.
@@ -31,11 +31,11 @@
 set -e
 
 # path to clone of https://github.com/googleapis/googleapis with
-#   master branch checked out.
+#   with the correct source branch checked out.
 export GOOGLEAPIS=${GOOGLEAPIS:=`realpath googleapis`}
 
 # path to clone of https://github.com/googleapis/googleapis-gen
-#   with master branch checked out.
+#   with the correct target branch checked out.
 export GOOGLEAPIS_GEN=${GOOGLEAPIS_GEN:=`realpath googleapis-gen`}
 
 mydir="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
@@ -58,7 +58,15 @@ for sha in $shas; do
         # Found a sha we already generated.
         break
     else
-        ungenerated_shas+=($sha)
+        # If as $sha is contained in a list of bad SHAs (SHAs that
+        # will cause bazel to fail) skip the sha. The variable $BROKEN_SHAS
+        # is defined in the Cloud Build UI, with the intention that it is only
+        # used for exceptional circumstances.
+        if echo $BROKEN_SHAS | grep $sha; then
+            echo "skipping $sha"
+        else
+            ungenerated_shas+=($sha)
+        fi
     fi
 done
 
@@ -71,8 +79,8 @@ for (( idx=${#ungenerated_shas[@]}-1 ; idx>=0 ; idx-- )) ; do
     # Choose build targets.
     if [[ -z "$BUILD_TARGETS" ]] ; then
         targets=$(cd "$GOOGLEAPIS" \
-        && bazel query $BAZEL_FLAGS 'filter("-(go|csharp|java|php|ruby|nodejs|py)\.tar\.gz$", kind("generated file", //...:*))' \
-        | grep -v -E ":(proto|grpc|gapic)-.*-java\.tar\.gz$")
+        && bazel query $BAZEL_FLAGS  'filter("-(go|csharp|java|php|ruby|nodejs|py)$", kind("rule", //...:*))' \
+        | grep -v -E ":(proto|grpc|gapic)-.*-java$")
     else
         targets="$BUILD_TARGETS"
     fi
@@ -102,7 +110,7 @@ for (( idx=${#ungenerated_shas[@]}-1 ; idx>=0 ; idx-- )) ; do
     failed_targets=()
     for target in $targets ; do
         let target_count++
-        tar_gz=$(echo "${target:2}" | tr ":" "/")
+        tar_gz=$(echo "${target:2}.tar.gz" | tr ":" "/")
         # Create the parent directory if it doesn't already exist.
         parent_dir=$(dirname $tar_gz)
         target_dir="$GOOGLEAPIS_GEN/$parent_dir"
@@ -133,12 +141,23 @@ for (( idx=${#ungenerated_shas[@]}-1 ; idx>=0 ; idx-- )) ; do
         git -C "$GOOGLEAPIS_GEN" tag "googleapis-$sha"
         git -C "$GOOGLEAPIS_GEN" push origin "googleapis-$sha"
     else
+        # Determine the current branch so we can explicitly push to it
+        # TODO(jskeet): use the commented-out line below; it requires
+        # a newer version of git (2.23.0) than we have (2.20.1).
+        # googleapis_gen_branch=$(git -C "$GOOGLEAPIS_GEN" branch --show-current)
+        if [[ $TARGET_BRANCH != "" ]]
+        then
+          googleapis_gen_branch=$TARGET_BRANCH
+        else
+          googleapis_gen_branch=master
+        fi
+
         # Copy the commit message from the commit in googleapis.
-        git -C "$GOOGLEAPIS" log -1 --format=%s%n%n%b > commit-msg.txt
+        git -C "$GOOGLEAPIS" log -1 --format=%B > commit-msg.txt
         echo "Source-Link: https://github.com/googleapis/googleapis/commit/$sha" >> commit-msg.txt
         # Commit changes and push them.
         git -C "$GOOGLEAPIS_GEN" commit -F "$(realpath commit-msg.txt)"
         git -C "$GOOGLEAPIS_GEN" tag "googleapis-$sha"
-        git -C "$GOOGLEAPIS_GEN" push origin master "googleapis-$sha"
+        git -C "$GOOGLEAPIS_GEN" push origin "$googleapis_gen_branch" "googleapis-$sha"
     fi
 done
