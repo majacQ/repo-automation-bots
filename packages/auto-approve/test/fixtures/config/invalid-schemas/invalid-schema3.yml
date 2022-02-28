@@ -1,0 +1,4 @@
+rules:
+- author: "release-please[bot]"
+  title: "chore: release"
+  changedFiles: "README.md$"

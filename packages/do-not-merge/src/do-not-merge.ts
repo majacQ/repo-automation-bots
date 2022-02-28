@@ -15,7 +15,6 @@
 /* eslint-disable node/no-extraneous-import */
 
 import {Probot, Context} from 'probot';
-import Webhooks from '@octokit/webhooks';
 import {logger} from 'gcf-utils';
 
 const DO_NOT_MERGE = 'do not merge';
@@ -39,9 +38,7 @@ export = (app: Probot) => {
       'pull_request.unlabeled',
       'pull_request.synchronize', // To run the check on every commit.
     ],
-    async (
-      context: Context<Webhooks.EventPayloads.WebhookPayloadPullRequest>
-    ) => {
+    async (context: Context<'pull_request'>) => {
       if (context.payload.pull_request.state === 'closed') {
         logger.info(
           `The pull request ${context.payload.pull_request.url} is closed, exiting.`
@@ -78,7 +75,6 @@ export = (app: Probot) => {
         }
         return;
       }
-      logger.info('Do not merge label found');
       if (existingCheck) {
         // If the check already exists and is _not_ a failure, make it a failure.
         if (existingCheck.conclusion !== 'failure') {
@@ -104,7 +100,6 @@ export = (app: Probot) => {
       logger.info(
         `Creating failed check on ${context.payload.pull_request.url}`
       );
-
       await context.octokit.checks.create({
         conclusion: 'failure',
         name: CHECK_NAME,
@@ -113,16 +108,17 @@ export = (app: Probot) => {
         head_sha: sha,
         output: FAILURE_OUTPUT,
       });
+      logger.metric('do_not_merge.add_label');
     }
   );
 };
 
 async function findCheck(
-  context: Context<Webhooks.EventPayloads.WebhookPayloadPullRequest>,
+  context: Context<'pull_request'>,
   owner: string,
   repo: string,
   sha: string
-): Promise<{id: number; conclusion: string} | undefined> {
+): Promise<{id: number; conclusion: string | null} | undefined> {
   const checks = (
     await context.octokit.checks.listForRef({
       owner,

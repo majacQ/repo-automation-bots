@@ -19,20 +19,14 @@ import nock from 'nock';
 import sinon, {SinonStub} from 'sinon';
 import {describe, it, beforeEach, afterEach, suite} from 'mocha';
 import handler from '../src/merge-on-green';
+import {MERGE_ON_GREEN_LABELS} from '../src/labels';
 import {logger} from 'gcf-utils';
 import assert from 'assert';
 // eslint-disable-next-line node/no-extraneous-import
-import {config} from '@probot/octokit-plugin-config';
+import {Octokit} from '@octokit/rest';
+import * as labelUtilsModule from '@google-automations/label-utils';
 
-import {createProbotAuth} from 'octokit-auth-probot';
-
-const TestingOctokit = ProbotOctokit.plugin(config).defaults({
-  authStrategy: createProbotAuth,
-  retry: {enabled: false},
-  throttle: {enabled: false},
-});
-
-const testingOctokitInstance = new TestingOctokit({auth: 'abc123'});
+const testingOctokitInstance = new Octokit({auth: 'abc123'});
 const sandbox = sinon.createSandbox();
 
 interface PR {
@@ -112,19 +106,15 @@ describe('merge-on-green wrapper logic', () => {
   let probot: Probot;
   let loggerStub: SinonStub;
 
-  before(() => {
-    loggerStub = sandbox.stub(logger, 'error').throwsArg(0);
-  });
-
-  after(() => {
-    loggerStub.restore();
-  });
-
   beforeEach(() => {
+    loggerStub = sandbox.stub(logger, 'error').throwsArg(0);
     probot = createProbot({
       overrides: {
         githubToken: 'abc123',
-        Octokit: TestingOctokit,
+        Octokit: ProbotOctokit.defaults({
+          retry: {enabled: false},
+          throttle: {enabled: false},
+        }),
       },
     });
 
@@ -133,21 +123,14 @@ describe('merge-on-green wrapper logic', () => {
 
   afterEach(() => {
     nock.cleanAll();
+    sandbox.restore();
   });
 
   describe('adding-a-PR-to-Datastore (addPR) method', async () => {
-    let removePRStub: SinonStub;
-    let getPRStub: SinonStub;
-
     beforeEach(() => {
-      removePRStub = sandbox.stub(handler, 'removePR');
-      getPRStub = sandbox.stub(handler, 'getPR');
+      sandbox.replace(handler, 'allowlist', ['testOwner']);
     });
 
-    afterEach(() => {
-      removePRStub.restore();
-      getPRStub.restore();
-    });
     it('does not add a PR if no branch protection', async () => {
       loggerStub.restore();
 
@@ -230,11 +213,6 @@ describe('merge-on-green wrapper logic', () => {
       getPRStub = sandbox.stub(handler, 'getPR');
     });
 
-    afterEach(() => {
-      addPRStub.restore();
-      removePRStub.restore();
-      getPRStub.restore();
-    });
     describe('cleaning up PRs', () => {
       it('deletes a PR if PR is closed when cleaning up repository', async () => {
         handler.getDatastore = async () => {
@@ -263,8 +241,10 @@ describe('merge-on-green wrapper logic', () => {
         ];
 
         await probot.receive({
-          name: 'schedule.repository' as '*',
-          payload: {org: 'testOwner', cleanUp: true},
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          name: 'schedule.global' as any,
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          payload: {cron_type: 'global', cleanUp: true} as any,
           id: 'abc123',
         });
 
@@ -281,8 +261,10 @@ describe('merge-on-green wrapper logic', () => {
         ];
 
         await probot.receive({
-          name: 'schedule.repository' as '*',
-          payload: {org: 'testOwner', cleanUp: true},
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          name: 'schedule.global' as any,
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          payload: {cron_type: 'global', cleanUp: true} as any,
           id: 'abc123',
         });
 
@@ -299,8 +281,10 @@ describe('merge-on-green wrapper logic', () => {
         ];
 
         await probot.receive({
-          name: 'schedule.repository' as '*',
-          payload: {org: 'testOwner', cleanUp: true},
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          name: 'schedule.global' as any,
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          payload: {cron_type: 'global', cleanUp: true} as any,
           id: 'abc123',
         });
 
@@ -312,8 +296,10 @@ describe('merge-on-green wrapper logic', () => {
         const scopes = [getPRCleanUp('open', false), getLabels('automerge')];
 
         await probot.receive({
-          name: 'schedule.repository' as '*',
-          payload: {org: 'testOwner', cleanUp: true},
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          name: 'schedule.global' as any,
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          payload: {cron_type: 'global', cleanUp: true} as any,
           id: 'abc123',
         });
 
@@ -330,18 +316,64 @@ describe('merge-on-green wrapper logic', () => {
 
         await probot.receive({
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          name: 'schedule.repository' as any,
-          payload: {org: 'googleapis', find_hanging_prs: true},
+          name: 'schedule.installation' as any,
+          payload: {
+            cron_type: 'installation',
+            cron_org: 'googleapis',
+            findHangingPRs: true,
+            installation: {id: 1234},
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          } as any,
           id: 'abc123',
         });
 
         scopes.forEach(s => s.done());
         assert(!addPRStub.called);
       });
+
+      it('does not run for non-org installations', async () => {
+        const stub = sandbox.stub(handler, 'scanForMissingPullRequests');
+
+        await probot.receive({
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          name: 'schedule.installation' as any,
+          payload: {
+            cron_type: 'installation',
+            findHangingPRs: true,
+            installation: {id: 1234},
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          } as any,
+          id: 'abc123',
+        });
+
+        sinon.assert.notCalled(stub);
+      });
+
+      it('does not run for non-allowed org installations', async () => {
+        const stub = sandbox.stub(handler, 'scanForMissingPullRequests');
+
+        await probot.receive({
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          name: 'schedule.installation' as any,
+          payload: {
+            cron_type: 'installation',
+            cron_org: 'external-organization',
+            findHangingPRs: true,
+            installation: {id: 1234},
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          } as any,
+          id: 'abc123',
+        });
+
+        sinon.assert.notCalled(stub);
+      });
     });
 
     describe('PRs when labeled', () => {
-      handler.allowlist = ['testOwner'];
+      beforeEach(() => {
+        sandbox.replace(handler, 'allowlist', ['testOwner']);
+      });
+      // handler.allowlist = ['testOwner'];
       it('adds a PR when label is added correctly', async () => {
         // eslint-disable-next-line @typescript-eslint/no-var-requires
         const payload = require(resolve(
@@ -385,7 +417,8 @@ describe('merge-on-green wrapper logic', () => {
             installation: {
               id: 'abc123',
             },
-          },
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          } as any,
           id: 'abc123',
         });
 
@@ -417,7 +450,8 @@ describe('merge-on-green wrapper logic', () => {
                 },
               ],
             },
-          },
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          } as any,
           id: 'abc123',
         });
 
@@ -454,7 +488,8 @@ describe('merge-on-green wrapper logic', () => {
             installation: {
               id: 'abc123',
             },
-          },
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          } as any,
           id: 'abc123',
         });
 
@@ -517,7 +552,8 @@ describe('merge-on-green wrapper logic', () => {
                 },
               ],
             },
-          },
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          } as any,
           id: 'abc123',
         });
 
@@ -568,7 +604,8 @@ describe('merge-on-green wrapper logic', () => {
                 },
               ],
             },
-          },
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          } as any,
           id: 'abc123',
         });
 
@@ -587,7 +624,8 @@ describe('merge-on-green wrapper logic', () => {
         await probot.receive({
           name: 'pull_request',
           payload: {
-            action: 'merged',
+            action: 'closed',
+            merged: 'true',
             repository: {
               name: 'notherightrepo',
               owner: {
@@ -606,7 +644,8 @@ describe('merge-on-green wrapper logic', () => {
                 },
               ],
             },
-          },
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          } as any,
           id: 'abc123',
         });
 
@@ -643,8 +682,14 @@ describe('merge-on-green wrapper logic', () => {
 
         await probot.receive({
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          name: 'schedule.repository' as any,
-          payload: {org: 'googleapis', find_hanging_prs: true},
+          name: 'schedule.installation' as any,
+          payload: {
+            cron_type: 'installation',
+            cron_org: 'googleapis',
+            findHangingPRs: true,
+            installation: {id: 1234},
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          } as any,
           id: 'abc123',
         });
 
@@ -679,8 +724,14 @@ describe('merge-on-green wrapper logic', () => {
 
         await probot.receive({
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          name: 'schedule.repository' as any,
-          payload: {org: 'googleapis', find_hanging_prs: true},
+          name: 'schedule.installation' as any,
+          payload: {
+            cron_type: 'installation',
+            cron_org: 'googleapis',
+            findHangingPRs: true,
+            installation: {id: 1234},
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          } as any,
           id: 'abc123',
         });
 
@@ -723,18 +774,56 @@ describe('merge-on-green wrapper logic', () => {
           ),
           searchForPRs([], 'automerge%3A%20exact'),
         ];
-
         await probot.receive({
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          name: 'schedule.repository' as any,
-          payload: {org: 'googleapis', find_hanging_prs: true},
+          name: 'schedule.installation' as any,
+          payload: {
+            cron_type: 'installation',
+            cron_org: 'googleapis',
+            findHangingPRs: true,
+            installation: {id: 1234},
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          } as any,
           id: 'abc123',
         });
-
         scopes.forEach(s => s.done());
         assert(getPRStub.called);
         assert(!addPRStub.called);
         getPRStub.restore();
+      });
+
+      it('syncs its own labels', async () => {
+        const sandbox = sinon.createSandbox();
+        const syncLabelsStub = sandbox.stub(labelUtilsModule, 'syncLabels');
+        const payload = {
+          repository: {
+            name: 'Hello-World',
+            full_name: 'Codertocat/Hello-World',
+            owner: {
+              login: 'Codertocat',
+            },
+          },
+          organization: {
+            login: 'Codertocat',
+          },
+          cron_org: 'Codertocat',
+          syncLabels: true,
+        };
+        await probot.receive({
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          name: 'schedule.repository' as any,
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          payload: payload as any,
+          id: 'abc123',
+        });
+        sinon.assert.calledOnceWithExactly(
+          syncLabelsStub,
+          sinon.match.instanceOf(ProbotOctokit),
+          'Codertocat',
+          'Hello-World',
+          sinon.match.array.deepEquals(MERGE_ON_GREEN_LABELS)
+        );
+        sandbox.restore();
       });
     }
   );

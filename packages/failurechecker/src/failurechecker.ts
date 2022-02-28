@@ -24,7 +24,7 @@ type OctokitType = InstanceType<typeof ProbotOctokit>;
 
 // labels indicative of the fact that a release has not completed yet.
 const RELEASE_LABELS = ['autorelease: pending', 'autorelease: failed'];
-const RELEASE_TYPE_NO_PUBLISH = ['go-yoshi'];
+const RELEASE_TYPE_NO_PUBLISH = ['go-yoshi', 'simple'];
 const SUCCESSFUL_PUBLISH_LABEL = 'autorelease: published';
 
 // We open an issue that a release has failed if it's been longer than 3
@@ -39,6 +39,7 @@ const START_HOUR_UTC = 17;
 const WELL_KNOWN_CONFIGURATION_FILE = 'release-please.yml';
 interface ConfigurationOptions {
   releaseType?: string;
+  disableFailureChecker?: boolean;
 }
 
 // exported for testing purposes
@@ -49,7 +50,8 @@ export const TimeMethods = {
 };
 
 export function failureChecker(app: Probot) {
-  app.on('schedule.repository' as '*', async context => {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  app.on('schedule.repository' as any, async context => {
     const utcHour = TimeMethods.Date().getUTCHours();
     const owner = context.payload.organization.login;
     const repo = context.payload.repository.name;
@@ -67,7 +69,8 @@ export function failureChecker(app: Probot) {
       )) as ConfigurationOptions | null) || {};
     const labels = [...RELEASE_LABELS];
     if (
-      RELEASE_TYPE_NO_PUBLISH.indexOf('' + configuration.releaseType) === -1
+      RELEASE_TYPE_NO_PUBLISH.indexOf('' + configuration.releaseType) === -1 &&
+      !configuration.disableFailureChecker
     ) {
       labels.push('autorelease: tagged');
     }
@@ -103,8 +106,14 @@ export function failureChecker(app: Probot) {
           ).data;
           if (
             pr.merged_at &&
+            pr.labels.some(l => labels.includes(l.name!)) &&
             !pr.labels.some(l => l.name === SUCCESSFUL_PUBLISH_LABEL)
           ) {
+            logger.info(
+              `found failure for ${owner}/${repo} pr = ${
+                pr.number
+              } labels = ${labels.join(',')}`
+            );
             failed.push(pr.number);
           }
         }

@@ -27,20 +27,27 @@
     "lint": "gts check"
   },
   "dependencies": {
-    "@octokit/openapi-types": "^5.0.0",
-    "gcf-utils": "^7.1.1",
+    "@google-automations/bot-config-utils": "^3.2.0",
+    "@google-automations/datastore-lock": "^2.1.0",
+    "@google-automations/label-utils": "^1.1.0",
+    "@octokit/openapi-types": "^9.0.0",
+    "@octokit/types": "^6.19.0",
+    "gcf-utils": "^12.0.0",
+    "probot": "^12.1.0",
     "xml-js": "^1.6.11"
   },
   "devDependencies": {
-    "@types/mocha": "^8.0.0",
-    "@types/node": "^12.6.1",
-    "c8": "^7.1.0",
-    "cross-env": "^7.0.0",
-    "gts": "^3.0.0",
-    "mocha": "^8.0.0",
-    "nock": "^13.0.0",
-    "snap-shot-it": "^7.8.0",
-    "typescript": "~4.2.0"
+    "@types/mocha": "^9.0.0",
+    "@types/node": "^16.3.3",
+    "@types/sinon": "^10.0.2",
+    "c8": "^7.7.3",
+    "cross-env": "^7.0.3",
+    "gts": "^3.1.0",
+    "mocha": "^9.0.2",
+    "nock": "^13.1.1",
+    "sinon": "^11.1.1",
+    "snap-shot-it": "^7.9.6",
+    "typescript": "~4.3.5"
   },
   "engines": {
     "node": ">= 12.18.2"

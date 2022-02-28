@@ -19,6 +19,7 @@ import {
   BranchProtectionRule,
   PermissionRule,
 } from './types';
+// eslint-disable-next-line node/no-extraneous-import
 import {Octokit} from '@octokit/rest';
 import checks from './required-checks.json';
 
@@ -62,6 +63,7 @@ const branchProtectionDefaults = deepFreeze({
   requiresStrictStatusChecks: false,
   restrictsPushes: false,
   restrictsReviewDismissals: false,
+  requiresLinearHistory: true,
   requiredStatusCheckContexts: [],
 });
 
@@ -78,7 +80,6 @@ export class SyncRepoSettings {
     const logger = this.logger;
     const repo = options.repo;
     const [owner, name] = repo.split('/');
-    let ignored = false;
     if (!config) {
       logger.info(`no local config found for ${repo}, checking global config`);
       // Fetch the list of languages used in this repository
@@ -115,51 +116,32 @@ export class SyncRepoSettings {
       if (!config) {
         logger.info(`no config for language ${language}`);
       }
-
-      // Check for repositories we're specifically configured to skip
-      ignored = !!languageConfig[language]?.ignoredRepos?.find(x => x === repo);
-      if (ignored) {
-        logger.info(`ignoring repo ${repo}`);
-      }
-
-      if (languageConfig[language]?.repoOverrides) {
-        const customConfig = languageConfig[language].repoOverrides!.find(
-          x => x.repo === repo
-        );
-        if (customConfig) {
-          logger.info(`Discovered override config for ${repo}`);
-          config.branchProtectionRules = customConfig.branchProtectionRules;
-        }
-      }
     }
 
     const jobs: Promise<void>[] = [];
+    logger.info('updating settings');
     jobs.push(this.updateRepoTeams(repo, config?.permissionRules || []));
-    if (!ignored && config) {
+    if (config) {
       jobs.push(this.updateRepoOptions(repo, config));
       if (config.branchProtectionRules) {
-        jobs.push(
-          this.updateMasterBranchProtection(repo, config.branchProtectionRules)
-        );
+        config.branchProtectionRules.forEach(rule => {
+          jobs.push(this.updateBranchProtection(repo, rule));
+        });
       }
     }
     await Promise.all(jobs);
   }
 
   /**
-   * Enable master branch protection, and required status checks
-   * @param repos List of repos to iterate.
+   * Enable branch protection, and required status checks
+   * @param repo Owner/Repo to update
+   * @param rule The branch protection rules
    */
-  async updateMasterBranchProtection(
-    repo: string,
-    rules: BranchProtectionRule[]
-  ) {
+  async updateBranchProtection(repo: string, rule: BranchProtectionRule) {
     const logger = this.logger;
-    logger.info(`Updating master branch protection for ${repo}`);
+    logger.info(`Updating ${rule.pattern} branch protection for ${repo}`);
     const [owner, name] = repo.split('/');
 
-    // TODO: add support for mutiple rules
-    let rule = rules[0];
     logger.debug('Rules before applying defaults:');
     logger.debug(rule);
 
@@ -186,19 +168,22 @@ export class SyncRepoSettings {
           strict: rule.requiresStrictStatusChecks!,
         },
         enforce_admins: rule.isAdminEnforced!,
+        required_linear_history: rule.requiresLinearHistory,
         restrictions: null!,
         headers: {
           accept: 'application/vnd.github.luke-cage-preview+json',
         },
       });
-      logger.info(`Success updating master branch protection for ${repo}`);
+      logger.info(
+        `Success updating branch protection for ${repo}:${rule.pattern}`
+      );
     } catch (err) {
       if (err.status === 401) {
         logger.warn(
-          `updateMasterBranchProtection: warning received ${err.status} updating ${owner}/${name}`
+          `updateBranchProtection: warning received ${err.status} updating ${owner}/${name}`
         );
       } else {
-        err.message = `updateMasterBranchProtection: error received ${err.status} updating ${owner}/${name}\n\n${err.message}`;
+        err.message = `updateBranchProtection: error received ${err.status} updating ${owner}/${name}\n\n${err.message}`;
         logger.error(err);
         return;
       }

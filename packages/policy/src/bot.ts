@@ -13,35 +13,54 @@
 // limitations under the License.
 
 // eslint-disable-next-line node/no-extraneous-import
-import {Probot, Context} from 'probot';
+import {Probot} from 'probot';
 import {logger} from 'gcf-utils';
 import {getPolicy} from './policy';
 import {exportToBigQuery} from './export';
-import {submitFixes} from './changer';
+import {getChanger} from './changer';
 
 export const allowedOrgs = ['googleapis', 'googlecloudplatform'];
 
 export function policyBot(app: Probot) {
-  app.on(['schedule.repository' as '*'], async (context: Context) => {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  app.on(['schedule.repository' as any], async context => {
     const owner: string = context.payload.organization.login;
     const name: string = context.payload.repository.name;
     const repo = `${owner}/${name}`;
 
-    if (
-      context.payload.cron_org !== owner ||
-      !allowedOrgs.includes(owner.toLowerCase())
-    ) {
-      logger.info(`skipping run for ${context.payload.cron_org}`);
+    if (!allowedOrgs.includes(owner.toLowerCase())) {
+      logger.info(`skipping run for ${repo}`);
       return;
     }
 
     const policy = getPolicy(context.octokit, logger);
     const repoMetadata = await policy.getRepo(repo);
+
+    // Skip archived or private repositories
     if (repoMetadata.private || repoMetadata.archived) {
       return;
     }
+
+    // For the GoogleCloudPlatform org, only scan or try to fix repositories
+    // with a 'samples' or 'libraries' repository topic.
+    if (owner.toLowerCase() === 'googlecloudplatform') {
+      const topics = repoMetadata.topics || [];
+      if (!(topics.includes('samples') || topics.includes('libraries'))) {
+        return;
+      }
+    }
+
     const result = await policy.checkRepoPolicy(repoMetadata);
     await exportToBigQuery(result);
-    await submitFixes(result, context.octokit);
+
+    // specifically wrap this in a try/catch to avoid retries if the fix
+    // causes any errors.  Otherwise, the entire function is retried, and the
+    // result is recorded twice.
+    try {
+      const changer = getChanger(context.octokit, repoMetadata);
+      await changer.submitFixes(result);
+    } catch (e) {
+      logger.error(e);
+    }
   });
 }

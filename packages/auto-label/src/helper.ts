@@ -17,6 +17,21 @@ import {logger} from 'gcf-utils';
 
 // *** Helper functions for all types fo labels ***
 
+export const CONFIG_FILE_NAME = 'auto-label.yaml';
+
+// Default app configs if user didn't specify a .config
+export const LABEL_PRODUCT_BY_DEFAULT = true;
+
+export const DEFAULT_CONFIGS = {
+  product: LABEL_PRODUCT_BY_DEFAULT,
+  language: {
+    pullrequest: false,
+  },
+  path: {
+    pullrequest: false,
+  },
+};
+
 /**
  * Checks whether the intended label already exists
  */
@@ -50,6 +65,7 @@ export interface Config {
   path?: {
     pullrequest?: boolean;
     labelprefix?: string;
+    paths?: PathConfig;
   };
   language?: LanguageConfig;
 }
@@ -89,7 +105,7 @@ export function autoDetectLabel(
   let firstPart = match ? match[1] : title;
 
   // Remove common prefixes. For example,
-  // https://github.com/GoogleCloudPlatform/java-docs-samples/issues/3578.
+  // https://github.com/GoogleCloudPlatform/java-docs-samples/issues/3578
   const trimPrefixes = ['com.example.', 'com.google.', 'snippets.'];
   for (const prefix of trimPrefixes) {
     if (firstPart.startsWith(prefix)) {
@@ -104,6 +120,7 @@ export function autoDetectLabel(
   firstPart = firstPart.split('_')[0]; // Before the underscore, if there is one.
   firstPart = firstPart.toLowerCase(); // Convert to lower case.
   firstPart = firstPart.replace(/\s/, ''); // Remove spaces.
+  firstPart = firstPart.replace('-', ''); // Remove dashes.
 
   // The Conventional Commits "docs" and "build" prefixes are far more common
   // than the APIs. So, never label those with "api: docs" or "api: build".

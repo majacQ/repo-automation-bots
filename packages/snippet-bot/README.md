@@ -1,6 +1,6 @@
 # snippet-bot
 
-Instructions are provided in [googleapis/repo-automation-bots](https://github.com/googleapis/repo-automation-bots/blob/master/README.md) for deploying and testing your bots.
+Instructions are provided in [googleapis/repo-automation-bots](https://github.com/googleapis/repo-automation-bots/blob/main/README.md) for deploying and testing your bots.
 
 ## Required permission
 This bot needs read/write permissions on PRs, Issues and Checks. Also make sure that the bot is listening to webhooks for PRs and Issues.
@@ -45,6 +45,9 @@ test.py:10, tag lol doesn't have a matching start tag
 test.py:8, tag world doesn't have a matching end tag
 ```
 
+The bot also create failing status check when the config file doesn't
+match the schema.
+
 ## Comment on PRs
 
 The bot adds a comment summarizing changes w.r.t region tags in the
@@ -61,13 +64,19 @@ bot will scan all the files in the repo and update the issue with the
 result.
 
 ## Configuration:
-You can specify `ignoreFiles` in `.github/snippet-bot.yml`. Here is an example:
+You can specify `ignoreFiles` and `alwaysCreateStatusCheck` in
+`.github/snippet-bot.yml`. Here is an example:
 
 ```yaml
 ignoreFiles:
   - packages/snippet-bot/README.md
   - "**/__snapshot__/*.js"
 ```
+
+* `ignoreFiles`
+  A list of glob patterns for ignoring files.
+* `alwaysCreateStatusCheck`
+  If set to `true`, snippet-bot will always create status checks.
 
 ## Running tests:
 

@@ -18,26 +18,26 @@ import fs from 'fs';
 import path from 'path';
 import process from 'process';
 
+export enum Platform {
+  CLOUD_FUNCTIONS = 'Cloud Functions',
+  CLOUD_RUN = 'Cloud Run',
+}
+
 export interface ProgramOptions {
   programName: string;
   exportName?: string;
   description: string;
   fileLocation: string;
+  platform: Platform;
 }
 
 export function checkValidity(opts: ProgramOptions) {
-  const validName = /[^-A-Za-z_\s]+/;
-  let string = JSON.stringify(opts);
-  string = string
-    .replace('{"programName":', '')
-    .replace(',"description":', '')
-    .replace(',"fileLocation":', '')
-    .replace(/"/g, '')
-    .replace(/}$/, '');
+  const validName = /[^-A-Za-z_]+/;
+  const botName = opts.programName;
 
-  if (validName.test(string)) {
+  if (validName.test(botName)) {
     console.log(
-      'You used an invalid character, like an integer. Please try again.'
+      'Only letters, hyphens, and underscores are permitted in the bot name. Please try again.'
     );
     return false;
   }
@@ -53,11 +53,11 @@ export function checkValidity(opts: ProgramOptions) {
   }
 
   if (fs.existsSync(path.join(opts.fileLocation))) {
-    console.log('Your progam name and location is not unique. Please rename.');
+    console.log('Your program name and location is not unique. Please rename.');
     return false;
   }
   opts.programName = opts.programName.toLowerCase();
-  opts.exportName = opts.programName.replace('-', '_');
+  opts.exportName = opts.programName.replace(/-/g, '_');
   return true;
 }
 
@@ -81,6 +81,12 @@ export async function collectUserInput(): Promise<ProgramOptions> {
         name: 'fileLocation',
         message: `This package will be saved in /packages/yourProgramName unless you specify another location and directory name here relative to ${process.cwd()} : `,
       },
+      {
+        type: 'select',
+        name: 'platform',
+        message: 'Select a platform',
+        choices: Object.values(Platform),
+      },
     ]);
     isValid = checkValidity(input);
   }
@@ -94,15 +100,33 @@ export async function collectUserInput(): Promise<ProgramOptions> {
  */
 export function creatingBotFiles(options: ProgramOptions) {
   console.log(`Creating new folder ${options.fileLocation}`);
-  fs.mkdirSync(options.fileLocation);
+  fs.mkdirSync(options.fileLocation, {recursive: true});
+
   const mkDir = options.fileLocation;
+  const handlebarsFileRegex = /.hbs$/;
+
+  // enables easier/convenient platform checking within hbs files
+  const [platformKey] = Object.entries(Platform).find(
+    ([, value]) => value === options.platform
+  )!;
+  const handlebarsOptions = {...options, platform: {[platformKey]: true}};
+
   const readAllFiles = function (dirNameRead: string, dirNameWrite: string) {
     console.log(`copying from ${dirNameRead} to ${dirNameWrite}...`);
     const files = fs.readdirSync(dirNameRead);
     files.forEach(file => {
       const fileName = file.toString();
-      const fileNameTemplate = Handlebars.compile(fileName);
-      const fileNameResult = fileNameTemplate(options);
+      const isHandlebarsFile = handlebarsFileRegex.test(fileName);
+      let fileNameResult = fileName;
+
+      if (isHandlebarsFile) {
+        const fileNameTemplate = Handlebars.compile(fileName);
+        fileNameResult = fileNameTemplate(handlebarsOptions).replace(
+          handlebarsFileRegex,
+          ''
+        );
+      }
+
       const readName = path.join(dirNameRead, file);
       const writeName = path.join(dirNameWrite, fileNameResult);
       if (fs.statSync(readName).isDirectory()) {
@@ -110,11 +134,15 @@ export function creatingBotFiles(options: ProgramOptions) {
         console.log(writeName + ' generated');
         readAllFiles(readName, writeName);
       } else {
-        const fileContents = fs.readFileSync(readName);
-        const template = Handlebars.compile(fileContents.toString());
-        const result = template(options);
+        if (isHandlebarsFile) {
+          const fileContents = fs.readFileSync(readName);
+          const template = Handlebars.compile(fileContents.toString());
+          fs.writeFileSync(writeName, template(handlebarsOptions));
+        } else {
+          fs.copyFileSync(readName, writeName);
+        }
+
         console.log(writeName + ' generated');
-        fs.writeFileSync(writeName, result);
       }
     });
   };

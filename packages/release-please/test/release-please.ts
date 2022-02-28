@@ -12,17 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import myProbotApp from '../src/release-please';
+import {api} from '../src/release-please';
+const myProbotApp = api.handler;
+import {RELEASE_PLEASE_LABELS} from '../src/labels';
 import {Runner} from '../src/runner';
 import {describe, it, beforeEach} from 'mocha';
 import {resolve} from 'path';
+import {Octokit} from '@octokit/rest';
+type OctokitType = InstanceType<typeof Octokit>;
 // eslint-disable-next-line node/no-extraneous-import
 import {Probot, createProbot, ProbotOctokit} from 'probot';
+import {PullRequestLabeledEvent} from '@octokit/webhooks-types';
 import * as fs from 'fs';
+import yaml from 'js-yaml';
 import * as sinon from 'sinon';
-import assert from 'assert';
-import {GitHubRelease, ReleasePR} from 'release-please';
+import assert, {fail} from 'assert';
+import {GitHubRelease, ReleasePR, factory, Errors} from 'release-please';
+import * as botConfigModule from '@google-automations/bot-config-utils';
+import * as labelUtilsModule from '@google-automations/label-utils';
 import nock from 'nock';
+// eslint-disable-next-line node/no-extraneous-import
+import {RequestError} from '@octokit/request-error';
 
 const sandbox = sinon.createSandbox();
 nock.disableNetConnect();
@@ -42,8 +52,32 @@ function assertReleaserType(expectedType: string, pr: ReleasePR) {
   );
 }
 
+function loadConfig(configFile: string) {
+  return yaml.load(
+    fs.readFileSync(resolve(fixturesPath, 'config', configFile), 'utf-8')
+  );
+}
+
+function stubDefaultBranchLookup() {
+  sandbox.replace(
+    api,
+    'getRepositoryDefaultBranch',
+    async (
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      owner: string,
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      repo: string,
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      _octokit: OctokitType
+    ): Promise<string> => {
+      return 'master';
+    }
+  );
+}
+
 describe('ReleasePleaseBot', () => {
   let probot: Probot;
+  let getConfigStub: sinon.SinonStub;
 
   beforeEach(() => {
     probot = createProbot({
@@ -56,10 +90,12 @@ describe('ReleasePleaseBot', () => {
       },
     });
     probot.load(myProbotApp);
+    getConfigStub = sandbox.stub(botConfigModule, 'getConfig');
   });
 
   afterEach(() => {
     sandbox.restore();
+    nock.cleanAll();
   });
 
   describe('push to master branch', () => {
@@ -75,17 +111,12 @@ describe('ReleasePleaseBot', () => {
         assertReleaserType('JavaYoshi', pr);
         executed = true;
       });
-      const config = fs.readFileSync(
-        resolve(fixturesPath, 'config', 'valid.yml')
-      );
-      const requests = nock('https://api.github.com')
-        .get(
-          '/repos/chingor13/google-auth-library-java/contents/.github%2Frelease-please.yml'
-        )
-        .reply(200, {content: config.toString('base64')});
+      getConfigStub.resolves(loadConfig('valid.yml'));
 
-      await probot.receive({name: 'push', payload, id: 'abc123'});
-      requests.done();
+      await probot.receive(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        {name: 'push', payload: payload as any, id: 'abc123'}
+      );
       assert(executed, 'should have executed the runner');
     });
 
@@ -100,34 +131,88 @@ describe('ReleasePleaseBot', () => {
         assert(pr instanceof GitHubRelease);
         releaserExecuted = true;
       });
-      const config = fs.readFileSync(
-        resolve(fixturesPath, 'config', 'valid_handle_gh_release.yml')
+      const releaseSpy = sandbox.spy(factory, 'githubRelease');
+      getConfigStub.resolves(loadConfig('valid_handle_gh_release.yml'));
+      await probot.receive(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        {name: 'push', payload: payload as any, id: 'abc123'}
       );
-      const requests = nock('https://api.github.com')
-        .get(
-          '/repos/chingor13/google-auth-library-java/contents/.github%2Frelease-please.yml'
-        )
-        .reply(200, config);
-
-      await probot.receive({name: 'push', payload, id: 'abc123'});
-      requests.done();
       assert(runnerExecuted, 'should have executed the runner');
       assert(releaserExecuted, 'GitHub release should have run');
+      assert(releaseSpy.calledWith(sinon.match.has('releaseLabel', undefined)));
+    });
+
+    it('should ignore duplicated GitHub releases', async () => {
+      let runnerExecuted = false;
+      let releaserExecuted = false;
+      sandbox.replace(Runner, 'runner', async (pr: ReleasePR) => {
+        assertReleaserType('JavaYoshi', pr);
+        runnerExecuted = true;
+      });
+      sandbox.replace(Runner, 'releaser', async (pr: GitHubRelease) => {
+        assert(pr instanceof GitHubRelease);
+        releaserExecuted = true;
+
+        throw new Errors.DuplicateReleaseError(
+          new RequestError('foo', 400, {
+            response: {
+              data: 'something',
+              status: 400,
+              url: 'https://foo.bar',
+              headers: {},
+            },
+            request: {
+              method: 'POST',
+              url: 'https://foo.bar',
+              headers: {},
+            },
+          }),
+          'abc'
+        );
+      });
+      const releaseSpy = sandbox.spy(factory, 'githubRelease');
+      getConfigStub.resolves(loadConfig('valid_handle_gh_release.yml'));
+      await probot.receive(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        {name: 'push', payload: payload as any, id: 'abc123'}
+      );
+      assert(runnerExecuted, 'should have executed the runner');
+      assert(releaserExecuted, 'GitHub release should have run');
+      assert(releaseSpy.calledWith(sinon.match.has('releaseLabel', undefined)));
+    });
+
+    it('should ignore configuration errors', async () => {
+      let runnerExecuted = false;
+      const releaserExecuted = false;
+      sandbox.replace(Runner, 'runner', async (pr: ReleasePR) => {
+        assertReleaserType('JavaYoshi', pr);
+        runnerExecuted = true;
+
+        throw new Errors.MissingRequiredFileError(
+          'versions.txt',
+          'YoshiJava',
+          'testOwner/testRepo'
+        );
+      });
+      sandbox.replace(Runner, 'releaser', async () => {
+        fail('should not get here');
+      });
+      getConfigStub.resolves(loadConfig('valid_handle_gh_release.yml'));
+      await probot.receive(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        {name: 'push', payload: payload as any, id: 'abc123'}
+      );
+      assert(runnerExecuted, 'should have executed the runner');
+      assert(!releaserExecuted, 'GitHub release should not have run');
     });
 
     it('should ignore if the branch is the configured primary branch', async () => {
       sandbox.stub(Runner, 'runner').rejects('should not be running a release');
-      const config = fs.readFileSync(
-        resolve(fixturesPath, 'config', 'feature_branch_as_primary.yml')
+      getConfigStub.resolves(loadConfig('feature_branch_as_primary.yml'));
+      await probot.receive(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        {name: 'push', payload: payload as any, id: 'abc123'}
       );
-      const requests = nock('https://api.github.com')
-        .get(
-          '/repos/chingor13/google-auth-library-java/contents/.github%2Frelease-please.yml'
-        )
-        .reply(200, config);
-
-      await probot.receive({name: 'push', payload, id: 'abc123'});
-      requests.done();
     });
 
     it('should allow overriding the release strategy from configuration', async () => {
@@ -136,17 +221,12 @@ describe('ReleasePleaseBot', () => {
         assertReleaserType('Ruby', pr);
         executed = true;
       });
-      const config = fs.readFileSync(
-        resolve(fixturesPath, 'config', 'ruby_release.yml')
+      stubDefaultBranchLookup();
+      getConfigStub.resolves(loadConfig('ruby_release.yml'));
+      await probot.receive(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        {name: 'push', payload: payload as any, id: 'abc123'}
       );
-      const requests = nock('https://api.github.com')
-        .get(
-          '/repos/chingor13/google-auth-library-java/contents/.github%2Frelease-please.yml'
-        )
-        .reply(200, config);
-
-      await probot.receive({name: 'push', payload, id: 'abc123'});
-      requests.done();
       assert(executed, 'should have executed the runner');
     });
 
@@ -156,17 +236,12 @@ describe('ReleasePleaseBot', () => {
         assert.deepStrictEqual(pr.packageName, '@google-cloud/foo');
         executed = true;
       });
-      const config = fs.readFileSync(
-        resolve(fixturesPath, 'config', 'ruby_release_alternate_pkg_name.yml')
+      stubDefaultBranchLookup();
+      getConfigStub.resolves(loadConfig('ruby_release_alternate_pkg_name.yml'));
+      await probot.receive(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        {name: 'push', payload: payload as any, id: 'abc123'}
       );
-      const requests = nock('https://api.github.com')
-        .get(
-          '/repos/chingor13/google-auth-library-java/contents/.github%2Frelease-please.yml'
-        )
-        .reply(200, config);
-
-      await probot.receive({name: 'push', payload, id: 'abc123'});
-      requests.done();
       assert(executed, 'should have executed the runner');
     });
 
@@ -176,35 +251,48 @@ describe('ReleasePleaseBot', () => {
         assert.deepStrictEqual(pr.labels, ['foo', 'bar']);
         executed = true;
       });
-      const config = fs.readFileSync(
-        resolve(fixturesPath, 'config', 'valid.yml')
+      getConfigStub.resolves(loadConfig('valid.yml'));
+      await probot.receive(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        {name: 'push', payload: payload as any, id: 'abc123'}
       );
-      const requests = nock('https://api.github.com')
-        .get(
-          '/repos/chingor13/google-auth-library-java/contents/.github%2Frelease-please.yml'
-        )
-        .reply(200, config);
-
-      await probot.receive({name: 'push', payload, id: 'abc123'});
-      requests.done();
       assert(executed, 'should have executed the runner');
+    });
+
+    it('should allow overriding the release label when creating a release', async () => {
+      let runnerExecuted = false;
+      let releaserExecuted = false;
+      sandbox.replace(Runner, 'runner', async (pr: ReleasePR) => {
+        assertReleaserType('JavaYoshi', pr);
+        runnerExecuted = true;
+      });
+      sandbox.replace(Runner, 'releaser', async (pr: GitHubRelease) => {
+        assert(pr instanceof GitHubRelease);
+        assert.strictEqual(pr.releaseLabel, 'autorelease: published');
+        releaserExecuted = true;
+      });
+      const releaseSpy = sandbox.spy(factory, 'githubRelease');
+      getConfigStub.resolves(loadConfig('override_release_tag.yml'));
+      await probot.receive(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        {name: 'push', payload: payload as any, id: 'abc123'}
+      );
+      assert(runnerExecuted, 'should have executed the runner');
+      assert(releaserExecuted, 'GitHub release should have run');
+      assert(
+        releaseSpy.calledWith(
+          sinon.match.has('releaseLabel', 'autorelease: published')
+        )
+      );
     });
 
     it('should ignore webhook if not configured', async () => {
       sandbox.stub(Runner, 'runner').rejects('should not be running a release');
-      const requests = nock('https://api.github.com')
-        .get(
-          '/repos/chingor13/google-auth-library-java/contents/.github%2Frelease-please.yml'
-        )
-        .reply(404)
-        .get(
-          // we check both an org level .github, and a project level .github.
-          '/repos/chingor13/.github/contents/.github%2Frelease-please.yml'
-        )
-        .reply(404);
-
-      await probot.receive({name: 'push', payload, id: 'abc123'});
-      requests.done();
+      getConfigStub.resolves(null);
+      await probot.receive(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        {name: 'push', payload: payload as any, id: 'abc123'}
+      );
     });
 
     it('should allow an empty config file with the defaults', async () => {
@@ -213,14 +301,12 @@ describe('ReleasePleaseBot', () => {
         assertReleaserType('JavaYoshi', pr);
         executed = true;
       });
-      const requests = nock('https://api.github.com')
-        .get(
-          '/repos/chingor13/google-auth-library-java/contents/.github%2Frelease-please.yml'
-        )
-        .reply(200, Buffer.from(''));
-
-      await probot.receive({name: 'push', payload, id: 'abc123'});
-      requests.done();
+      stubDefaultBranchLookup();
+      getConfigStub.resolves({});
+      await probot.receive(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        {name: 'push', payload: payload as any, id: 'abc123'}
+      );
       assert(executed, 'should have executed the runner');
     });
 
@@ -231,17 +317,12 @@ describe('ReleasePleaseBot', () => {
         assert(pr.bumpMinorPreMajor);
         executed = true;
       });
-      const config = fs.readFileSync(
-        resolve(fixturesPath, 'config', 'minor_pre_major.yml')
+      stubDefaultBranchLookup();
+      getConfigStub.resolves(loadConfig('minor_pre_major.yml'));
+      await probot.receive(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        {name: 'push', payload: payload as any, id: 'abc123'}
       );
-      const requests = nock('https://api.github.com')
-        .get(
-          '/repos/chingor13/google-auth-library-java/contents/.github%2Frelease-please.yml'
-        )
-        .reply(200, config);
-
-      await probot.receive({name: 'push', payload, id: 'abc123'});
-      requests.done();
       assert(executed, 'should have executed the runner');
     });
 
@@ -252,34 +333,24 @@ describe('ReleasePleaseBot', () => {
         assert('master' === pr.gh.defaultBranch);
         executed = true;
       });
-      const config = fs.readFileSync(
-        resolve(fixturesPath, 'config', 'release_type_no_primary_branch.yml')
+      stubDefaultBranchLookup();
+      getConfigStub.resolves(loadConfig('release_type_no_primary_branch.yml'));
+      await probot.receive(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        {name: 'push', payload: payload as any, id: 'abc123'}
       );
-      const requests = nock('https://api.github.com')
-        .get(
-          '/repos/chingor13/google-auth-library-java/contents/.github%2Frelease-please.yml'
-        )
-        .reply(200, config);
-
-      await probot.receive({name: 'push', payload, id: 'abc123'});
-      requests.done();
       assert(executed, 'should have executed the runner');
     });
 
     describe('for manifest releases', () => {
       it('should build a release PR', async () => {
         const manifest = sandbox.stub(Runner, 'manifest').resolves();
-        const config = fs.readFileSync(
-          resolve(fixturesPath, 'config', 'manifest.yml')
+        getConfigStub.resolves(loadConfig('manifest.yml'));
+        stubDefaultBranchLookup();
+        await probot.receive(
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          {name: 'push', payload: payload as any, id: 'abc123'}
         );
-        const requests = nock('https://api.github.com')
-          .get(
-            '/repos/chingor13/google-auth-library-java/contents/.github%2Frelease-please.yml'
-          )
-          .reply(200, config);
-
-        await probot.receive({name: 'push', payload, id: 'abc123'});
-        requests.done();
         assert(manifest.called, 'should have executed the runner');
       });
 
@@ -288,20 +359,30 @@ describe('ReleasePleaseBot', () => {
         const manifestRelease = sandbox
           .stub(Runner, 'manifestRelease')
           .resolves();
-        const config = fs.readFileSync(
-          resolve(fixturesPath, 'config', 'manifest_handle_gh_release.yml')
+        getConfigStub.resolves(loadConfig('manifest_handle_gh_release.yml'));
+        await probot.receive(
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          {name: 'push', payload: payload as any, id: 'abc123'}
         );
-        const requests = nock('https://api.github.com')
-          .get(
-            '/repos/chingor13/google-auth-library-java/contents/.github%2Frelease-please.yml'
-          )
-          .reply(200, config);
-
-        await probot.receive({name: 'push', payload, id: 'abc123'});
-        requests.done();
         assert(manifest.called, 'should have executed the runner');
         assert(manifestRelease.called, 'GitHub release should have run');
       });
+    });
+
+    it('should allow configuring extra files', async () => {
+      let executed = false;
+      sandbox.replace(Runner, 'runner', async (pr: ReleasePR) => {
+        assert.deepStrictEqual(pr.extraFiles, [
+          'src/com/google/foo/Version.java',
+        ]);
+        executed = true;
+      });
+      getConfigStub.resolves(loadConfig('extra_files.yml'));
+      await probot.receive(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        {name: 'push', payload: payload as any, id: 'abc123'}
+      );
+      assert(executed, 'should have executed the runner');
     });
   });
 
@@ -314,17 +395,11 @@ describe('ReleasePleaseBot', () => {
 
     it('should ignore the webhook', async () => {
       sandbox.stub(Runner, 'runner').rejects('should not be running a release');
-      const config = fs.readFileSync(
-        resolve(fixturesPath, 'config', 'valid.yml')
+      getConfigStub.resolves(loadConfig('valid.yml'));
+      await probot.receive(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        {name: 'push', payload: payload as any, id: 'abc123'}
       );
-      const requests = nock('https://api.github.com')
-        .get(
-          '/repos/chingor13/google-auth-library-java/contents/.github%2Frelease-please.yml'
-        )
-        .reply(200, config);
-
-      await probot.receive({name: 'push', payload, id: 'abc123'});
-      requests.done();
     });
 
     it('should create the PR if the branch is the configured primary branch', async () => {
@@ -333,17 +408,11 @@ describe('ReleasePleaseBot', () => {
         assertReleaserType('JavaYoshi', pr);
         executed = true;
       });
-      const config = fs.readFileSync(
-        resolve(fixturesPath, 'config', 'feature_branch_as_primary.yml')
+      getConfigStub.resolves(loadConfig('feature_branch_as_primary.yml'));
+      await probot.receive(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        {name: 'push', payload: payload as any, id: 'abc123'}
       );
-      const requests = nock('https://api.github.com')
-        .get(
-          '/repos/chingor13/google-auth-library-java/contents/.github%2Frelease-please.yml'
-        )
-        .reply(200, config);
-
-      await probot.receive({name: 'push', payload, id: 'abc123'});
-      requests.done();
       assert(executed, 'should have executed the runner');
     });
 
@@ -353,17 +422,11 @@ describe('ReleasePleaseBot', () => {
         assertReleaserType('JavaYoshi', pr);
         executed = true;
       });
-      const config = fs.readFileSync(
-        resolve(fixturesPath, 'config', 'multi_branch.yml')
+      getConfigStub.resolves(loadConfig('multi_branch.yml'));
+      await probot.receive(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        {name: 'push', payload: payload as any, id: 'abc123'}
       );
-      const requests = nock('https://api.github.com')
-        .get(
-          '/repos/chingor13/google-auth-library-java/contents/.github%2Frelease-please.yml'
-        )
-        .reply(200, config);
-
-      await probot.receive({name: 'push', payload, id: 'abc123'});
-      requests.done();
       assert(executed, 'should have executed the runner');
     });
   });
@@ -371,6 +434,7 @@ describe('ReleasePleaseBot', () => {
   describe('nightly event', () => {
     it('should try to create a snapshot', async () => {
       let executed = false;
+      const syncLabelsStub = sandbox.stub(labelUtilsModule, 'syncLabels');
       const payload = {
         repository: {
           name: 'Hello-World',
@@ -388,29 +452,79 @@ describe('ReleasePleaseBot', () => {
         assertReleaserType('JavaYoshi', pr);
         executed = true;
       });
-      const config = fs.readFileSync(
-        resolve(fixturesPath, 'config', 'valid.yml')
-      );
+      getConfigStub.resolves(loadConfig('valid.yml'));
       const repository = require(resolve(fixturesPath, './repository'));
       const requests = nock('https://api.github.com')
-        .get(
-          '/repos/Codertocat/Hello-World/contents/.github%2Frelease-please.yml'
-        )
-        .reply(200, config)
         .get('/repos/Codertocat/Hello-World')
         .reply(200, repository);
 
       await probot.receive({
         // See: https://github.com/octokit/webhooks.js/issues/277
-        name: 'schedule.repository' as '*',
-        payload,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        name: 'schedule.repository' as any,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        payload: payload as any,
         id: 'abc123',
       });
       requests.done();
       assert(executed, 'should have executed the runner');
+      sinon.assert.calledOnceWithExactly(
+        syncLabelsStub,
+        sinon.match.instanceOf(ProbotOctokit),
+        'Codertocat',
+        'Hello-World',
+        sinon.match.array.deepEquals(RELEASE_PLEASE_LABELS)
+      );
+    });
+
+    it('should try to create a snapshot even when syncLabels fails', async () => {
+      let executed = false;
+      const syncLabelsStub = sandbox.stub(labelUtilsModule, 'syncLabels');
+      syncLabelsStub.rejects(new Error('Testing failure case'));
+      const payload = {
+        repository: {
+          name: 'Hello-World',
+          full_name: 'Codertocat/Hello-World',
+          owner: {
+            login: 'Codertocat',
+          },
+        },
+        organization: {
+          login: 'Codertocat',
+        },
+        cron_org: 'Codertocat',
+      };
+      sandbox.replace(Runner, 'runner', async (pr: ReleasePR) => {
+        assertReleaserType('JavaYoshi', pr);
+        executed = true;
+      });
+      getConfigStub.resolves(loadConfig('valid.yml'));
+      const repository = require(resolve(fixturesPath, './repository'));
+      const requests = nock('https://api.github.com')
+        .get('/repos/Codertocat/Hello-World')
+        .reply(200, repository);
+
+      await probot.receive({
+        // See: https://github.com/octokit/webhooks.js/issues/277
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        name: 'schedule.repository' as any,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        payload: payload as any,
+        id: 'abc123',
+      });
+      requests.done();
+      assert(executed, 'should have executed the runner');
+      sinon.assert.calledOnceWithExactly(
+        syncLabelsStub,
+        sinon.match.instanceOf(ProbotOctokit),
+        'Codertocat',
+        'Hello-World',
+        sinon.match.array.deepEquals(RELEASE_PLEASE_LABELS)
+      );
     });
 
     it('should try to create a snapshot on multiple branches', async () => {
+      const syncLabelsStub = sandbox.stub(labelUtilsModule, 'syncLabels');
       const executedBranches: Map<string, string> = new Map();
       const payload = {
         repository: {
@@ -428,27 +542,30 @@ describe('ReleasePleaseBot', () => {
       sandbox.replace(Runner, 'runner', async (pr: ReleasePR) => {
         executedBranches.set(pr.gh.defaultBranch!, getReleaserName(pr));
       });
-      const config = fs.readFileSync(
-        resolve(fixturesPath, 'config', 'multi_branch.yml')
-      );
+      getConfigStub.resolves(loadConfig('multi_branch.yml'));
       const repository = require(resolve(fixturesPath, './repository'));
       const requests = nock('https://api.github.com')
-        .get(
-          '/repos/Codertocat/Hello-World/contents/.github%2Frelease-please.yml'
-        )
-        .reply(200, config)
         .get('/repos/Codertocat/Hello-World')
         .reply(200, repository);
 
       await probot.receive({
         // See: https://github.com/octokit/webhooks.js/issues/277
-        name: 'schedule.repository' as '*',
-        payload,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        name: 'schedule.repository' as any,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        payload: payload as any,
         id: 'abc123',
       });
       requests.done();
       assert(executedBranches.get('master') === 'JavaBom');
       assert(executedBranches.get('feature-branch') === 'JavaYoshi');
+      sinon.assert.calledOnceWithExactly(
+        syncLabelsStub,
+        sinon.match.instanceOf(ProbotOctokit),
+        'Codertocat',
+        'Hello-World',
+        sinon.match.array.deepEquals(RELEASE_PLEASE_LABELS)
+      );
     });
   });
 
@@ -462,22 +579,16 @@ describe('ReleasePleaseBot', () => {
         assertReleaserType('JavaYoshi', pr);
         executed = true;
       });
-      const config = fs.readFileSync(
-        resolve(fixturesPath, 'config', 'valid.yml')
-      );
+      getConfigStub.resolves(loadConfig('valid.yml'));
       const requests = nock('https://api.github.com')
-        .get(
-          '/repos/Codertocat/Hello-World/contents/.github%2Frelease-please.yml'
-        )
-        .reply(200, config)
         .delete(
           '/repos/Codertocat/Hello-World/issues/2/labels/release-please%3Aforce-run'
         )
         .reply(200);
 
       await probot.receive({
-        name: 'pull_request.labeled',
-        payload,
+        name: 'pull_request',
+        payload: payload as PullRequestLabeledEvent,
         id: 'abc123',
       });
       requests.done();
@@ -494,22 +605,16 @@ describe('ReleasePleaseBot', () => {
         assertReleaserType('JavaYoshi', pr);
         executed = true;
       });
-      const config = fs.readFileSync(
-        resolve(fixturesPath, 'config', 'multi_branch.yml')
-      );
+      getConfigStub.resolves(loadConfig('multi_branch.yml'));
       const requests = nock('https://api.github.com')
-        .get(
-          '/repos/Codertocat/Hello-World/contents/.github%2Frelease-please.yml'
-        )
-        .reply(200, config)
         .delete(
           '/repos/Codertocat/Hello-World/issues/2/labels/release-please%3Aforce-run'
         )
         .reply(200);
 
       await probot.receive({
-        name: 'pull_request.labeled',
-        payload,
+        name: 'pull_request',
+        payload: payload as PullRequestLabeledEvent,
         id: 'abc123',
       });
       requests.done();
@@ -521,10 +626,46 @@ describe('ReleasePleaseBot', () => {
       sandbox.stub(Runner, 'runner').rejects('should not be running a release');
 
       await probot.receive({
-        name: 'pull_request.labeled',
-        payload,
+        name: 'pull_request',
+        payload: payload as PullRequestLabeledEvent,
         id: 'abc123',
       });
     });
+  });
+
+  it('should fetch default branch from GitHub if not provided', async () => {
+    const payload = require(resolve(fixturesPath, './push_to_main'));
+    let executed = false;
+    sandbox.replace(Runner, 'runner', async (pr: ReleasePR) => {
+      assertReleaserType('Ruby', pr);
+      executed = true;
+    });
+    const requests = nock('https://api.github.com')
+      .get('/repos/chingor13/google-auth-library-java')
+      .reply(200, {
+        default_branch: 'main',
+      });
+    getConfigStub.resolves(loadConfig('ruby_release.yml'));
+    await probot.receive(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      {name: 'push', payload: payload as any, id: 'abc123'}
+    );
+    assert(executed, 'should have executed the runner');
+    requests.done();
+  });
+
+  it('should use primaryBranch from config if one is set', async () => {
+    const payload = require(resolve(fixturesPath, './push_to_main'));
+    let executed = false;
+    sandbox.replace(Runner, 'runner', async (pr: ReleasePR) => {
+      assertReleaserType('JavaYoshi', pr);
+      executed = true;
+    });
+    getConfigStub.resolves(loadConfig('main_branch.yml'));
+    await probot.receive(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      {name: 'push', payload: payload as any, id: 'abc123'}
+    );
+    assert(executed, 'should have executed the runner');
   });
 });

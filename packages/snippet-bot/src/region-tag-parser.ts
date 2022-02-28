@@ -13,9 +13,13 @@
 // limitations under the License.
 
 import {Violation} from './violations';
+import {isFile} from './utils';
 
+/* eslint-disable-next-line node/no-extraneous-import */
+import {Octokit} from '@octokit/rest';
 import parseDiff from 'parse-diff';
 import fetch from 'node-fetch';
+import {logger} from 'gcf-utils';
 
 /**
  * The result for unmatched region tag checks.
@@ -61,6 +65,7 @@ const END_TAG_REGEX = /\[END ([^\]]*)\]/;
  * Detects region tag changes in a pull request and return the summary.
  */
 export async function parseRegionTagsInPullRequest(
+  octokit: Octokit,
   diffUrl: string,
   owner: string,
   repo: string,
@@ -84,29 +89,110 @@ export async function parseRegionTagsInPullRequest(
     if (file.to !== undefined && file.to !== '/dev/null') {
       ret.files.push(file.to);
     }
-    for (const chunk of file.chunks) {
-      for (const change of chunk.changes) {
-        if (change.type === 'normal') {
+    if (
+      file.to !== undefined &&
+      file.to !== '/dev/null' &&
+      file.from !== undefined &&
+      file.from !== '/dev/null' &&
+      file.from !== file.to
+    ) {
+      // For the case of renaming the file, we scan the files directly,
+      // no need to understand the diffs.
+      try {
+        const blobBeforeRename = await octokit.repos.getContent({
+          owner: owner,
+          repo: repo,
+          path: file.from,
+          ref: sha,
+        });
+        if (!isFile(blobBeforeRename.data)) {
           continue;
         }
-        // We only track add/deletion of start tags.
-        const startMatch = change.content.match(START_TAG_REGEX);
-        if (startMatch) {
-          if (change.type === 'add') {
-            ret.added += 1;
-          }
-          if (change.type === 'del') {
+        const fileContentsBeforeRename = Buffer.from(
+          blobBeforeRename.data.content,
+          'base64'
+        ).toString('utf8');
+
+        const linesBeforeRename = fileContentsBeforeRename.split('\n');
+        for (let i = 0; i < linesBeforeRename.length; i++) {
+          const startMatch = linesBeforeRename[i].match(START_TAG_REGEX);
+          if (startMatch) {
             ret.deleted += 1;
+            ret.changes.push({
+              type: 'del',
+              regionTag: startMatch[1],
+              owner: owner,
+              repo: repo,
+              file: file.from,
+              sha: sha,
+              line: i + 1,
+            });
           }
-          ret.changes.push({
-            type: change.type === 'del' ? 'del' : 'add',
-            regionTag: startMatch[1],
-            owner: change.type === 'del' ? owner : headOwner,
-            repo: change.type === 'del' ? repo : headRepo,
-            file: change.type === 'del' ? file.from : file.to,
-            sha: change.type === 'del' ? sha : headSha,
-            line: change.ln,
-          });
+        }
+        const blobAfterRename = await octokit.repos.getContent({
+          owner: headOwner,
+          repo: headRepo,
+          path: file.to,
+          ref: headSha,
+        });
+        if (!isFile(blobAfterRename.data)) {
+          continue;
+        }
+        const fileContentsAfterRename = Buffer.from(
+          blobAfterRename.data.content,
+          'base64'
+        ).toString('utf8');
+
+        const linesAfterRename = fileContentsAfterRename.split('\n');
+        for (let i = 0; i < linesAfterRename.length; i++) {
+          const startMatch = linesAfterRename[i].match(START_TAG_REGEX);
+          if (startMatch) {
+            ret.added += 1;
+            ret.changes.push({
+              type: 'add',
+              regionTag: startMatch[1],
+              owner: headOwner,
+              repo: headRepo,
+              file: file.to,
+              sha: headSha,
+              line: i + 1,
+            });
+          }
+        }
+      } catch (err) {
+        // See: https://github.com/googleapis/repo-automation-bots/issues/2246
+        // TODO: Migrate to Git Data API.
+        err.message =
+          'Skipping the diff entry because it failed to read the' +
+          ` file: ${err.message}`;
+        logger.error(err);
+        continue;
+      }
+    } else {
+      for (const chunk of file.chunks) {
+        for (const change of chunk.changes) {
+          if (change.type === 'normal') {
+            continue;
+          }
+          // We only track add/deletion of start tags.
+          const startMatch = change.content.match(START_TAG_REGEX);
+          if (startMatch) {
+            if (change.type === 'add') {
+              ret.added += 1;
+            }
+            if (change.type === 'del') {
+              ret.deleted += 1;
+            }
+            ret.changes.push({
+              type: change.type === 'del' ? 'del' : 'add',
+              regionTag: startMatch[1],
+              owner: change.type === 'del' ? owner : headOwner,
+              repo: change.type === 'del' ? repo : headRepo,
+              file: change.type === 'del' ? file.from : file.to,
+              sha: change.type === 'del' ? sha : headSha,
+              line: change.ln,
+            });
+          }
         }
       }
     }

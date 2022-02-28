@@ -33,7 +33,9 @@ options:
 | `path`              | Create a release from a path other than the repository's root | `string` | the repository root                                                          |
 | `changelogPath`     | Path to the changelog to write releases notes to when creating a release | `string` | `CHANGELOG.md`                                                    |
 | `manifest`          | Whether or not this is a manifest release          | `boolean`  | `false`                                                                               |
+| `extraFiles`        | Additional files to track (if language supports it) | `string[]` | `[]`                                                                                 |
 | `branches`          | Additional release branches to track               | `BranchConfiguration[]` | `[]`                                                                     |
+| `releaseLabel`      | The label applied to pull request after creating the GitHub release | `string` | release-please default (`autorelease: tagged`)                         |
 
 `BranchConfiguration`:
 
@@ -48,7 +50,24 @@ options:
 | `path`              | Create a release from a path other than the repository's root | `string` | the repository root                                                          |
 | `changelogPath`     | Path to the changelog to write releases notes to when creating a release | `string` | `CHANGELOG.md`                                                    |
 | `manifest`          | Whether or not this is a manifest release          | `boolean`  | `false`                                                                               |
+| `extraFiles`        | Additional files to track (if language supports it) | `string[]` | `[]`                                                                                 |
+| `releaseLabel`      | The label applied to pull request after creating the GitHub release | `string` | release-please default (`autorelease: tagged`)                         |
 
+### Usage
+
+After installing the GitHub app, and creating a `.github/release-please.yml` configuration,
+releases should be automatically proposed on commits to the configured branch(es).
+
+#### Forcing the bot to run
+
+To force a re-run, you may add the `release-please:force-run` label to *any* pull
+request. The bot should respond by running and removing that label.
+
+#### Handling GitHub releases
+
+The bot can optionally, tag the GitHub releases after a release pull request is
+merged. To do so, set `handleGHRelease` to `true` in your `.github/release-please.yml`
+configuration.
 
 ## Testing
 

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// eslint-disable-next-line node/no-extraneous-import
 import {Octokit} from '@octokit/rest';
 import nock from 'nock';
 import sinon from 'sinon';
@@ -19,7 +20,7 @@ import assert from 'assert';
 import {URL} from 'url';
 import {describe, it, afterEach} from 'mocha';
 import * as suggester from 'code-suggester';
-import {PolicyResult} from '../src/policy';
+import {GitHubRepo, PolicyResult} from '../src/policy';
 import * as changer from '../src/changer';
 
 nock.disableNetConnect();
@@ -41,16 +42,27 @@ describe('changer', () => {
     timestamp: new Date(),
   };
 
+  const repo = {
+    full_name: 'googleapis/nodejs-storage',
+    default_branch: 'main',
+  } as unknown as GitHubRepo;
+
   afterEach(() => {
     nock.cleanAll();
     sinon.restore();
   });
 
-  it('should get a code of conduct', async () => {
+  it('should fetch a changer', () => {
+    const octokit = new Octokit();
+    const c = changer.getChanger(octokit, repo);
+    assert.ok(c);
+  });
+
+  it('should fetch a file and cache it', async () => {
     const cocText = 'coc';
     const url = new URL(changer.cocUrl);
     const scope = nock(url.origin).get(url.pathname).reply(200, cocText);
-    const coc = await changer.getCoC();
+    const coc = await changer.cachedGet(changer.cocUrl);
     assert.strictEqual(coc, cocText);
     scope.done();
   });
@@ -58,12 +70,11 @@ describe('changer', () => {
   it('should submit code of conduct fixes', async () => {
     const octokit = new Octokit();
     const scope = nock('https://api.github.com')
-      .get(
-        '/search/issues?q=repo%3Agoogleapis%2Fnodejs-storage%20%22chore%3A%20add%20a%20Code%20of%20Conduct%22%20in%3Atitle%20is%3Aopen'
-      )
-      .reply(200, {total_count: 0});
+      .get('/repos/googleapis/nodejs-storage/pulls?state=open&per_page=100')
+      .reply(200, []);
     const stub = sinon.stub(suggester, 'createPullRequest').resolves();
-    await changer.submitFixes(result, octokit);
+    const c = new changer.Changer(octokit, repo);
+    await c.submitFixes(result);
     assert.ok(stub.calledOnce);
     scope.done();
   });
@@ -71,11 +82,14 @@ describe('changer', () => {
   it('should not submit code of conduct fixes if a PR already exists', async () => {
     const octokit = new Octokit();
     const scope = nock('https://api.github.com')
-      .get(
-        '/search/issues?q=repo%3Agoogleapis%2Fnodejs-storage%20%22chore%3A%20add%20a%20Code%20of%20Conduct%22%20in%3Atitle%20is%3Aopen'
-      )
-      .reply(200, {total_count: 1});
-    await changer.submitFixes(result, octokit);
+      .get('/repos/googleapis/nodejs-storage/pulls?state=open&per_page=100')
+      .reply(200, [
+        {
+          title: 'chore: add a Code of Conduct',
+        },
+      ]);
+    const c = new changer.Changer(octokit, repo);
+    await c.submitFixes(result);
     scope.done();
   });
 });

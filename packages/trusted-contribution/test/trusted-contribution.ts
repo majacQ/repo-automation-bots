@@ -12,26 +12,43 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import {describe, it, beforeEach} from 'mocha';
+import {describe, it, afterEach, beforeEach} from 'mocha';
+import assert from 'assert';
 import {resolve} from 'path';
 // eslint-disable-next-line node/no-extraneous-import
 import {Probot, createProbot, ProbotOctokit} from 'probot';
+import {
+  PullRequestOpenedEvent,
+  PullRequestSynchronizeEvent,
+} from '@octokit/webhooks-types';
+// eslint-disable-next-line node/no-extraneous-import
+import {Octokit} from '@octokit/rest';
 import nock from 'nock';
+import sinon from 'sinon';
 import * as fs from 'fs';
+import yaml from 'js-yaml';
+import {logger} from 'gcf-utils';
+import * as botConfigModule from '@google-automations/bot-config-utils';
 
+import {WELL_KNOWN_CONFIGURATION_FILE} from '../src/config';
 import myProbotApp from '../src/trusted-contribution';
+import * as utilsModule from '../src/utils';
+import schema from '../src/config-schema.json';
 
 nock.disableNetConnect();
 
 const fixturesPath = resolve(__dirname, '../../test/fixtures');
 
-// TODO: stop disabling warn once the following upstream patch is landed:
-// https://github.com/probot/probot/pull/926
-global.console.warn = () => {};
+function loadConfig(configFile: string) {
+  return yaml.load(fs.readFileSync(resolve(fixturesPath, configFile), 'utf-8'));
+}
 
 describe('TrustedContributionTestRunner', () => {
+  const sandbox = sinon.createSandbox();
   let probot: Probot;
   let requests: nock.Scope;
+  let getConfigStub: sinon.SinonStub;
+  let validateConfigStub: sinon.SinonStub;
 
   beforeEach(() => {
     probot = createProbot({
@@ -45,22 +62,22 @@ describe('TrustedContributionTestRunner', () => {
     });
     probot.load(myProbotApp);
     requests = nock('https://api.github.com');
+    getConfigStub = sandbox.stub(botConfigModule, 'getConfig');
+    validateConfigStub = sandbox.stub(
+      botConfigModule.ConfigChecker.prototype,
+      'validateConfigChanges'
+    );
+  });
+
+  afterEach(() => {
+    sandbox.restore();
+    nock.cleanAll();
   });
 
   describe('without configuration file', () => {
     beforeEach(() => {
-      requests = requests
-        .get(
-          '/repos/chingor13/google-auth-library-java/contents/.github%2Ftrusted-contribution.yml'
-        )
-        .reply(404)
-        .get(
-          // FIXME(#68): why is this necessary?
-          '/repos/chingor13/.github/contents/.github%2Ftrusted-contribution.yml'
-        )
-        .reply(404);
+      getConfigStub.resolves(null);
     });
-
     describe('opened pull request', () => {
       it('sets a label on PR, if PR author is a trusted contributor', async () => {
         requests = requests
@@ -76,6 +93,9 @@ describe('TrustedContributionTestRunner', () => {
             action: 'opened',
             pull_request: {
               number: 3,
+              head: {
+                sha: 'testsha',
+              },
               user: {
                 login: 'renovate-bot',
               },
@@ -86,10 +106,26 @@ describe('TrustedContributionTestRunner', () => {
                 login: 'chingor13',
               },
             },
-          },
+          } as PullRequestOpenedEvent,
           id: 'abc123',
         });
         requests.done();
+        sinon.assert.calledOnceWithExactly(
+          getConfigStub,
+          sinon.match.instanceOf(ProbotOctokit),
+          'chingor13',
+          'google-auth-library-java',
+          WELL_KNOWN_CONFIGURATION_FILE,
+          {schema: schema}
+        );
+        sinon.assert.calledOnceWithExactly(
+          validateConfigStub,
+          sinon.match.instanceOf(ProbotOctokit),
+          'chingor13',
+          'google-auth-library-java',
+          'testsha',
+          3
+        );
       });
 
       it('does not set a label on PR, if PR author is not a trusted contributor', async () => {
@@ -99,6 +135,9 @@ describe('TrustedContributionTestRunner', () => {
             action: 'opened',
             pull_request: {
               number: 3,
+              head: {
+                sha: 'testsha',
+              },
               user: {
                 login: 'notauthorized',
               },
@@ -109,7 +148,7 @@ describe('TrustedContributionTestRunner', () => {
                 login: 'chingor13',
               },
             },
-          },
+          } as PullRequestOpenedEvent,
           id: 'abc123',
         });
         requests.done();
@@ -131,6 +170,9 @@ describe('TrustedContributionTestRunner', () => {
             action: 'opened',
             pull_request: {
               number: 3,
+              head: {
+                sha: 'testsha',
+              },
               user: {
                 login: 'renovate-bot',
               },
@@ -141,7 +183,7 @@ describe('TrustedContributionTestRunner', () => {
                 login: 'chingor13',
               },
             },
-          },
+          } as PullRequestOpenedEvent,
           id: 'abc123',
         });
         requests.done();
@@ -154,6 +196,9 @@ describe('TrustedContributionTestRunner', () => {
             action: 'opened',
             pull_request: {
               number: 3,
+              head: {
+                sha: 'testsha',
+              },
               user: {
                 login: 'notauthorized',
               },
@@ -164,40 +209,29 @@ describe('TrustedContributionTestRunner', () => {
                 login: 'chingor13',
               },
             },
-          },
+          } as PullRequestOpenedEvent,
           id: 'abc123',
         });
-        requests.done();
         requests.done();
       });
     });
   });
 
-  describe('with a custom configuration file', () => {
+  describe('with a configuration file with disabled: true', () => {
     beforeEach(() => {
-      const config = fs.readFileSync(resolve(fixturesPath, 'custom.yml'));
-      requests = requests
-        .get(
-          '/repos/chingor13/google-auth-library-java/contents/.github%2Ftrusted-contribution.yml'
-        )
-        .reply(200, config);
+      getConfigStub.resolves(loadConfig('disabled.yml'));
     });
-
     describe('opened pull request', () => {
-      it('sets a label on PR, if PR author is a trusted contributor', async () => {
-        requests = requests
-          .post(
-            '/repos/chingor13/google-auth-library-java/issues/3/labels',
-            () => true
-          )
-          .reply(200);
-
+      it('quits even if PR author is a trusted contributor', async () => {
         await probot.receive({
           name: 'pull_request',
           payload: {
             action: 'opened',
             pull_request: {
               number: 3,
+              head: {
+                sha: 'testsha',
+              },
               user: {
                 login: 'custom-user',
               },
@@ -208,7 +242,52 @@ describe('TrustedContributionTestRunner', () => {
                 login: 'chingor13',
               },
             },
-          },
+          } as PullRequestOpenedEvent,
+          id: 'abc123',
+        });
+        requests.done();
+      });
+    });
+  });
+  describe('with a custom configuration file', () => {
+    beforeEach(() => {
+      getConfigStub.resolves(loadConfig('custom.yml'));
+    });
+
+    describe('opened pull request', () => {
+      it('sets a label on PR, if PR author is a trusted contributor', async () => {
+        requests = requests
+          .post(
+            '/repos/chingor13/google-auth-library-java/issues/3/labels',
+            (body: object) => {
+              assert.deepStrictEqual(body, {
+                labels: ['kokoro:force-run', 'owlbot:run'],
+              });
+              return true;
+            }
+          )
+          .reply(200);
+
+        await probot.receive({
+          name: 'pull_request',
+          payload: {
+            action: 'opened',
+            pull_request: {
+              number: 3,
+              head: {
+                sha: 'testsha',
+              },
+              user: {
+                login: 'custom-user',
+              },
+            },
+            repository: {
+              name: 'google-auth-library-java',
+              owner: {
+                login: 'chingor13',
+              },
+            },
+          } as PullRequestOpenedEvent,
           id: 'abc123',
         });
         requests.done();
@@ -221,6 +300,9 @@ describe('TrustedContributionTestRunner', () => {
             action: 'opened',
             pull_request: {
               number: 3,
+              head: {
+                sha: 'testsha',
+              },
               user: {
                 login: 'release-please[bot]',
               },
@@ -231,7 +313,7 @@ describe('TrustedContributionTestRunner', () => {
                 login: 'chingor13',
               },
             },
-          },
+          } as PullRequestOpenedEvent,
           id: 'abc123',
         });
         requests.done();
@@ -253,6 +335,9 @@ describe('TrustedContributionTestRunner', () => {
             action: 'opened',
             pull_request: {
               number: 3,
+              head: {
+                sha: 'testsha',
+              },
               user: {
                 login: 'custom-user',
               },
@@ -263,7 +348,7 @@ describe('TrustedContributionTestRunner', () => {
                 login: 'chingor13',
               },
             },
-          },
+          } as PullRequestOpenedEvent,
           id: 'abc123',
         });
         requests.done();
@@ -276,6 +361,9 @@ describe('TrustedContributionTestRunner', () => {
             action: 'opened',
             pull_request: {
               number: 3,
+              head: {
+                sha: 'testsha',
+              },
               user: {
                 login: 'release-please[bot]',
               },
@@ -286,7 +374,7 @@ describe('TrustedContributionTestRunner', () => {
                 login: 'chingor13',
               },
             },
-          },
+          } as PullRequestOpenedEvent,
           id: 'abc123',
         });
         requests.done();
@@ -296,12 +384,7 @@ describe('TrustedContributionTestRunner', () => {
 
   describe('with an empty configuration file', () => {
     beforeEach(() => {
-      const config = fs.readFileSync(resolve(fixturesPath, 'empty.yml'));
-      requests = requests
-        .get(
-          '/repos/chingor13/google-auth-library-java/contents/.github%2Ftrusted-contribution.yml'
-        )
-        .reply(200, config);
+      getConfigStub.resolves(loadConfig('empty.yml'));
     });
 
     describe('opened pull request', () => {
@@ -319,6 +402,9 @@ describe('TrustedContributionTestRunner', () => {
             action: 'opened',
             pull_request: {
               number: 3,
+              head: {
+                sha: 'testsha',
+              },
               user: {
                 login: 'renovate-bot',
               },
@@ -329,7 +415,7 @@ describe('TrustedContributionTestRunner', () => {
                 login: 'chingor13',
               },
             },
-          },
+          } as PullRequestOpenedEvent,
           id: 'abc123',
         });
         requests.done();
@@ -342,6 +428,9 @@ describe('TrustedContributionTestRunner', () => {
             action: 'opened',
             pull_request: {
               number: 3,
+              head: {
+                sha: 'testsha',
+              },
               user: {
                 login: 'unauthorized',
               },
@@ -352,7 +441,7 @@ describe('TrustedContributionTestRunner', () => {
                 login: 'chingor13',
               },
             },
-          },
+          } as PullRequestOpenedEvent,
           id: 'abc123',
         });
         requests.done();
@@ -374,6 +463,9 @@ describe('TrustedContributionTestRunner', () => {
             action: 'synchronize',
             pull_request: {
               number: 3,
+              head: {
+                sha: 'testsha',
+              },
               user: {
                 login: 'renovate-bot',
               },
@@ -384,7 +476,7 @@ describe('TrustedContributionTestRunner', () => {
                 login: 'chingor13',
               },
             },
-          },
+          } as PullRequestSynchronizeEvent,
           id: 'abc123',
         });
         requests.done();
@@ -397,6 +489,9 @@ describe('TrustedContributionTestRunner', () => {
             action: 'synchronize',
             pull_request: {
               number: 3,
+              head: {
+                sha: 'testsha',
+              },
               user: {
                 login: 'unauthorized',
               },
@@ -407,7 +502,7 @@ describe('TrustedContributionTestRunner', () => {
                 login: 'chingor13',
               },
             },
-          },
+          } as PullRequestSynchronizeEvent,
           id: 'abc123',
         });
         requests.done();
@@ -417,14 +512,7 @@ describe('TrustedContributionTestRunner', () => {
 
   describe('with an empty list of contributors file', () => {
     beforeEach(() => {
-      const config = fs.readFileSync(
-        resolve(fixturesPath, 'no-contributors.yml')
-      );
-      requests = requests
-        .get(
-          '/repos/chingor13/google-auth-library-java/contents/.github%2Ftrusted-contribution.yml'
-        )
-        .reply(200, config);
+      getConfigStub.resolves(loadConfig('no-contributors.yml'));
     });
 
     describe('opened pull request', () => {
@@ -435,6 +523,9 @@ describe('TrustedContributionTestRunner', () => {
             action: 'opened',
             pull_request: {
               number: 3,
+              head: {
+                sha: 'testsha',
+              },
               user: {
                 login: 'renovate-bot',
               },
@@ -445,7 +536,7 @@ describe('TrustedContributionTestRunner', () => {
                 login: 'chingor13',
               },
             },
-          },
+          } as PullRequestOpenedEvent,
           id: 'abc123',
         });
         requests.done();
@@ -458,6 +549,9 @@ describe('TrustedContributionTestRunner', () => {
             action: 'opened',
             pull_request: {
               number: 3,
+              head: {
+                sha: 'testsha',
+              },
               user: {
                 login: 'custom-user',
               },
@@ -468,10 +562,9 @@ describe('TrustedContributionTestRunner', () => {
                 login: 'chingor13',
               },
             },
-          },
+          } as PullRequestOpenedEvent,
           id: 'abc123',
         });
-        requests.done();
         requests.done();
       });
     });
@@ -484,6 +577,9 @@ describe('TrustedContributionTestRunner', () => {
             action: 'synchronize',
             pull_request: {
               number: 3,
+              head: {
+                sha: 'testsha',
+              },
               user: {
                 login: 'renovate-bot',
               },
@@ -494,7 +590,7 @@ describe('TrustedContributionTestRunner', () => {
                 login: 'chingor13',
               },
             },
-          },
+          } as PullRequestSynchronizeEvent,
           id: 'abc123',
         });
         requests.done();
@@ -507,6 +603,9 @@ describe('TrustedContributionTestRunner', () => {
             action: 'synchronize',
             pull_request: {
               number: 3,
+              head: {
+                sha: 'testsha',
+              },
               user: {
                 login: 'renovate-bot',
               },
@@ -517,11 +616,90 @@ describe('TrustedContributionTestRunner', () => {
                 login: 'chingor13',
               },
             },
-          },
+          } as PullRequestSynchronizeEvent,
           id: 'abc123',
         });
         requests.done();
       });
     });
+  });
+
+  it('should add a comment if configured with annotations', async () => {
+    getConfigStub.resolves(loadConfig('gcbrun.yml'));
+    const sandbox = sinon.createSandbox();
+    const getAuthenticatedOctokitStub = sandbox.stub(
+      utilsModule,
+      'getAuthenticatedOctokit'
+    );
+    const testOctokit = new Octokit();
+    const octokitIssuesSpy = sandbox.spy(testOctokit.issues, 'createComment');
+    getAuthenticatedOctokitStub.resolves(testOctokit);
+    requests
+      .post(
+        '/repos/chingor13/google-auth-library-java/issues/3/comments',
+        () => true
+      )
+      .reply(200);
+
+    await probot.receive({
+      name: 'pull_request',
+      payload: {
+        action: 'opened',
+        pull_request: {
+          number: 3,
+          head: {
+            sha: 'testsha',
+          },
+          user: {
+            login: 'renovate-bot',
+          },
+        },
+        repository: {
+          name: 'google-auth-library-java',
+          owner: {
+            login: 'chingor13',
+          },
+        },
+      } as PullRequestOpenedEvent,
+      id: 'abc123',
+    });
+    requests.done();
+    sandbox.restore();
+    sinon.assert.calledOnceWithExactly(
+      getAuthenticatedOctokitStub,
+      process.env.PROJECT_ID || '',
+      utilsModule.SECRET_NAME_FOR_COMMENT_PERMISSION
+    );
+    assert(octokitIssuesSpy.calledOnce);
+  });
+
+  it('should log an error if the config cannot be fetched', async () => {
+    getConfigStub.rejects(new Error('500'));
+    const errorStub = sinon.stub(logger, 'error');
+
+    await probot.receive({
+      name: 'pull_request',
+      payload: {
+        action: 'opened',
+        pull_request: {
+          number: 3,
+          head: {
+            sha: 'testsha',
+          },
+          user: {
+            login: 'not-real',
+          },
+        },
+        repository: {
+          name: 'google-auth-library-java',
+          owner: {
+            login: 'chingor13',
+          },
+        },
+      } as PullRequestOpenedEvent,
+      id: 'abc123',
+    });
+    assert.ok(errorStub.calledOnce);
+    requests.done();
   });
 });

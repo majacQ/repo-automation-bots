@@ -18,9 +18,17 @@ import {FirestoreConfigsStore, Db} from './database';
 // eslint-disable-next-line node/no-extraneous-import
 import {Probot, Logger} from 'probot';
 import {logger} from 'gcf-utils';
+import {syncLabels} from '@google-automations/label-utils';
 import {core} from './core';
 import {Octokit} from '@octokit/rest';
-import {onPostProcessorPublished, scanGithubForConfigs} from './handlers';
+import {
+  onPostProcessorPublished,
+  refreshConfigs,
+  scanGithubForConfigs,
+} from './handlers';
+import {PullRequestLabeledEvent} from '@octokit/webhooks-types';
+import {OWLBOT_RUN_LABEL, OWL_BOT_IGNORE, OWL_BOT_LABELS} from './labels';
+import {OwlBotLock} from './config-files';
 
 interface PubSubContext {
   github: Octokit;
@@ -33,7 +41,11 @@ interface PubSubContext {
   };
 }
 
-export = (privateKey: string | undefined, app: Probot, db?: Db) => {
+export function OwlBot(
+  privateKey: string | undefined,
+  app: Probot,
+  db?: Db
+): void {
   // Fail fast if the Cloud Function doesn't have its environment configured:
   if (!process.env.APP_ID) {
     throw Error('must set APP_ID');
@@ -63,6 +75,17 @@ export = (privateKey: string | undefined, app: Probot, db?: Db) => {
 
   // We perform post processing on pull requests.  We run the specified docker container
   // on the pending pull request and push any changes back to the pull request.
+  app.on(['pull_request.labeled'], async context => {
+    await exports.handlePullRequestLabeled(
+      appId,
+      privateKey,
+      project,
+      trigger,
+      context.payload,
+      context.octokit
+    );
+  });
+
   app.on(
     [
       'pull_request.opened',
@@ -70,94 +93,39 @@ export = (privateKey: string | undefined, app: Probot, db?: Db) => {
       'pull_request.reopened',
     ],
     async context => {
-      const head = context.payload.pull_request.head;
-      const base = context.payload.pull_request.base;
+      const head = context.payload.pull_request.head.repo.full_name;
+      const base = context.payload.pull_request.base.repo.full_name;
+      const [owner, repo] = head.split('/');
       const installation = context.payload.installation?.id;
+      const prNumber = context.payload.pull_request.number;
+
       if (!installation) {
-        throw Error(`no installation token found for ${head.repo.full_name}`);
+        throw Error(`no installation token found for ${head}`);
       }
+
       // If the pull request is from a fork, the label "owlbot:run" must be
       // added by a maintainer to trigger the post processor.
-      // TODO(bcoe): add support for "owlbot:run" label.
-      if (head.repo.full_name !== base.repo.full_name) {
-        logger.info(
-          `head ${head.repo.full_name} does not match base ${base.repo.full_name} skipping`
-        );
+      if (head !== base) {
+        logger.info(`head ${head} does not match base ${base} skipping`);
         return;
       }
 
-      // Detect looping OwlBot behavior and break the cycle:
-      const [owner, repo] = head.repo.full_name.split('/');
-      if (
-        await core.hasOwlBotLoop(
+      await runPostProcessor(
+        appId,
+        privateKey,
+        project,
+        trigger,
+        {
+          head,
+          base,
+          prNumber,
+          installation,
           owner,
           repo,
-          context.payload.pull_request.number,
-          context.octokit
-        )
-      ) {
-        throw Error(
-          `too many OwlBot updates created in a row for ${owner}/${repo}`
-        );
-      }
-
-      // Fetch the .Owlbot.lock.yaml from the head ref:
-      const lock = await core.getOwlBotLock(
-        head.repo.full_name,
-        context.payload.pull_request.number,
-        context.octokit
-      );
-      if (!lock) {
-        logger.info(`no .OwlBot.lock.yaml found for ${head.repo.full_name}`);
-        return;
-      }
-      const image = `${lock.docker.image}@${lock.docker.digest}`;
-      // Run time image from .Owlbot.lock.yaml on Cloud Build:
-      const buildStatus = await core.triggerPostProcessBuild(
-        {
-          image,
-          project,
-          privateKey,
-          appId,
-          installation,
-          repo: head.repo.full_name,
-          pr: context.payload.pull_request.number,
-          trigger,
+          defaultBranch: context.payload?.repository?.default_branch,
         },
         context.octokit
       );
-      // Update pull request with status of job:
-      await core.createCheck(
-        {
-          privateKey,
-          appId,
-          installation,
-          pr: context.payload.pull_request.number,
-          repo: head.repo.full_name,
-          text: buildStatus.text,
-          summary: buildStatus.summary,
-          conclusion: buildStatus.conclusion,
-          title: `🦉 OwlBot - ${buildStatus.summary}`,
-        },
-        context.octokit
-      );
-      // If running post-processor has created a noop change, close the
-      // pull request:
-      const files = (
-        await context.octokit.pulls.listFiles({
-          owner,
-          repo,
-          pull_number: context.payload.pull_request.number,
-        })
-      ).data;
-      if (!files.length) {
-        await context.octokit.pulls.update({
-          owner,
-          repo,
-          pull_number: context.payload.pull_request.number,
-          state: 'closed',
-        });
-      }
     }
   );
 
@@ -166,13 +134,14 @@ export = (privateKey: string | undefined, app: Probot, db?: Db) => {
   // Probot no longer allows custom `.on` in types, so we cast to
   // any to circumvent this issue:
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  app.on('pubsub.message' as any, async (context: PubSubContext) => {
+  app.on('pubsub.message' as any, async context => {
+    const typedContext = context as unknown as PubSubContext;
     // TODO: flesh out tests for pubsub.message handler:
-    logger.info(JSON.stringify(context.payload));
-    if (context.payload.action === 'INSERT') {
+    logger.info(JSON.stringify(typedContext.payload));
+    if (typedContext.payload.action === 'INSERT') {
       const configStore = new FirestoreConfigsStore(db!);
-      const dockerImageDigest = context.payload.digest.split('@')[1];
-      const dockerImageName = context.payload.tag;
+      const dockerImageDigest = typedContext.payload.digest.split('@')[1];
+      const dockerImageName = typedContext.payload.tag;
       logger.info({dockerImageDigest, dockerImageName});
       await onPostProcessorPublished(
         configStore,
@@ -184,18 +153,306 @@ export = (privateKey: string | undefined, app: Probot, db?: Db) => {
     }
   });
 
-  // Run periodically, to ensure that up-to-date configuration is stored
-  // for repositories:
-  app.on('schedule.repository' as '*', async context => {
+  // Ensure up-to-date configuration is stored on merge
+  app.on('pull_request.closed', async context => {
     const configStore = new FirestoreConfigsStore(db!);
-    logger.info(
-      `scan ${context.payload.org} istallation = ${context.payload.installation.id}`
+    const installationId = context.payload.installation?.id;
+    const org = context.payload.organization?.login;
+
+    logger.info("Updating repo's configs via `pull_request.closed`");
+
+    if (!installationId || !org) {
+      logger.error(`Missing install id (${installationId}) or org (${org})`);
+      return;
+    }
+
+    const configs = await configStore.getConfigs(
+      context.payload.repository.full_name
     );
-    await scanGithubForConfigs(
+
+    await refreshConfigs(
       configStore,
+      configs,
       context.octokit,
-      context.payload.org,
-      Number(context.payload.installation.id)
+      org,
+      context.payload.repository.name,
+      context.payload.repository.default_branch ?? 'master',
+      installationId
     );
   });
+
+  // Repository cron handler.
+  // We share this handler between two cron jobs.
+  // Both cron job has its own parameter.
+  // See cron.yaml
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  app.on('schedule.repository' as any, async context => {
+    if (context.payload.syncLabels === true) {
+      // owl-bot-sync-label cron entry
+      // syncing labels
+      const owner = context.payload.organization.login;
+      const repo = context.payload.repository.name;
+      await syncLabels(context.octokit, owner, repo, OWL_BOT_LABELS);
+      return;
+    }
+    if (context.payload.scanGithubForConfigs === true) {
+      // owl-bot-scan-googleapis cron entry
+      // Scan googleapis repositories and ensure config is up to date
+      const configStore = new FirestoreConfigsStore(db!);
+      logger.info(
+        `scan ${context.payload.org} istallation = ${context.payload.installation.id}`
+      );
+      logger.info('Scanning GitHub for configs via `schedule.repository`');
+
+      await scanGithubForConfigs(
+        configStore,
+        context.octokit,
+        context.payload.org,
+        Number(context.payload.installation.id)
+      );
+      return;
+    }
+  });
+}
+
+export async function handlePullRequestLabeled(
+  appId: number,
+  privateKey: string,
+  project: string,
+  trigger: string,
+  payload: PullRequestLabeledEvent,
+  octokit: Octokit
+) {
+  const head = payload.pull_request.head.repo.full_name;
+  const base = payload.pull_request.base.repo.full_name;
+  const [owner, repo] = base.split('/');
+  const installation = payload.installation?.id;
+  const prNumber = payload.pull_request.number;
+
+  if (!installation) {
+    throw Error(`no installation token found for ${head}`);
+  }
+
+  const hasRunLabel = !!payload.pull_request.labels.filter(
+    l => l.name === OWLBOT_RUN_LABEL
+  ).length;
+
+  // Only run post-processor if appropriate label added:
+  if (!hasRunLabel) {
+    logger.info(
+      `skipping labels ${payload.pull_request.labels
+        .map(l => l.name)
+        .join(', ')} ${head} for ${base}`
+    );
+    return;
+  }
+
+  // If the last commit made to the PR was already from OwlBot, and the label
+  // has been added by a bot account (most likely trusted contributor bot)
+  // do not run the post processor:
+  if (
+    isBotAccount(payload.sender.login) &&
+    (await core.lastCommitFromOwlBot(owner, repo, prNumber, octokit))
+  ) {
+    await removeOwlBotRunLabel(owner, repo, prNumber, octokit);
+    logger.info(
+      `skipping post-processor run for ${owner}/${repo} pr = ${prNumber}`
+    );
+    return;
+  }
+
+  await runPostProcessor(
+    appId,
+    privateKey,
+    project,
+    trigger,
+    {
+      head,
+      base,
+      prNumber,
+      installation,
+      owner,
+      repo,
+      defaultBranch: payload?.repository?.default_branch,
+    },
+    octokit
+  );
+  await removeOwlBotRunLabel(owner, repo, prNumber, octokit);
+  logger.metric('owlbot.run_post_processor');
+}
+
+/*
+ * Remove owl:bot label, ignoring errors caused by label already being removed.
+ *
+ * @param {string} owner - org of PR.
+ * @param {string} repo - repo of PR.
+ * @param {number} repo - PR number.
+ */
+async function removeOwlBotRunLabel(
+  owner: string,
+  repo: string,
+  prNumber: number,
+  octokit: Octokit
+) {
+  try {
+    await octokit.issues.removeLabel({
+      name: OWLBOT_RUN_LABEL,
+      issue_number: prNumber,
+      owner,
+      repo,
+    });
+  } catch (err) {
+    if (err.status === 404) {
+      logger.warn(`${err.message} head = ${owner}/${repo} pr = ${prNumber}`);
+    } else {
+      throw err;
+    }
+  }
+}
+
+/*
+ * Return whether or not the sender that triggered this event
+ * is a bot account.
+ *
+ * @param {string} sender - user that triggered event.
+ * @returns boolean whether or not sender was bot.
+ */
+function isBotAccount(sender: string): boolean {
+  // GitHub apps have a [bot] suffix on their sender name, e.g.,
+  // google-cla[bot].
+  return /.*\[bot]$/.test(sender);
+}
+
+interface RunPostProcessorOpts {
+  head: string;
+  base: string;
+  prNumber: number;
+  installation: number;
+  owner: string;
+  repo: string;
+  defaultBranch?: string;
+}
+const runPostProcessor = async (
+  appId: number,
+  privateKey: string,
+  project: string,
+  trigger: string,
+  opts: RunPostProcessorOpts,
+  octokit: Octokit
+) => {
+  // Fetch the .Owlbot.lock.yaml from head of PR:
+  let lock: OwlBotLock | undefined = undefined;
+  // Attempt to load the OwlBot lock file for a repository, if the lock
+  // file is corrupt an error will be thrown and we should show a failing
+  // status:
+  try {
+    lock = await core.getOwlBotLock(opts.base, opts.prNumber, octokit);
+  } catch (err) {
+    await core.createCheck(
+      {
+        privateKey,
+        appId,
+        installation: opts.installation,
+        pr: opts.prNumber,
+        repo: opts.base,
+        text: err.message,
+        summary: 'The OwlBot lock file on this repository is corrupt',
+        conclusion: 'failure',
+        title: '🦉 OwlBot - failure',
+        detailsURL:
+          'https://github.com/googleapis/repo-automation-bots/tree/master/packages/owl-bot',
+      },
+      octokit
+    );
+    return;
+  }
+  if (!lock) {
+    logger.info(`no .OwlBot.lock.yaml found for ${opts.head}`);
+    // If OwlBot is not configured on repo, indicate success. This makes
+    // it easier to enable OwlBot as a required check during migration:
+    await core.createCheck(
+      {
+        privateKey,
+        appId,
+        installation: opts.installation,
+        pr: opts.prNumber,
+        repo: opts.base,
+        text: 'OwlBot is not yet enabled on this repository',
+        summary: 'OwlBot is not yet enabled on this repository',
+        conclusion: 'success',
+        title: '🦉 OwlBot - success',
+        detailsURL:
+          'https://github.com/googleapis/repo-automation-bots/tree/master/packages/owl-bot',
+      },
+      octokit
+    );
+    return;
+  }
+  // Detect looping OwlBot behavior and break the cycle:
+  if (await core.hasOwlBotLoop(opts.owner, opts.repo, opts.prNumber, octokit)) {
+    throw Error(
+      `too many OwlBot updates created in a row for ${opts.owner}/${opts.repo}`
+    );
+  }
+  const image = `${lock.docker.image}@${lock.docker.digest}`;
+  // Run time image from .Owlbot.lock.yaml on Cloud Build:
+  const buildStatus = await core.triggerPostProcessBuild(
+    {
+      image,
+      project,
+      privateKey,
+      appId,
+      installation: opts.installation,
+      repo: opts.base,
+      pr: opts.prNumber,
+      trigger,
+      defaultBranch: opts.defaultBranch,
+    },
+    octokit
+  );
+
+  if (null === buildStatus) {
+    // Update pull request with status of job:
+    await core.createCheck(
+      {
+        privateKey,
+        appId,
+        installation: opts.installation,
+        pr: opts.prNumber,
+        repo: opts.base,
+        text: `Ignored by Owl Bot because of ${OWL_BOT_IGNORE} label`,
+        summary: `Ignored by Owl Bot because of ${OWL_BOT_IGNORE} label`,
+        conclusion: 'success',
+        title: '🦉 OwlBot - ignored',
+        detailsURL:
+          'https://github.com/googleapis/repo-automation-bots/blob/main/packages/owl-bot/README.md',
+      },
+      octokit
+    );
+    return;
+  }
+
+  // Update pull request with status of job:
+  await core.createCheck(
+    {
+      privateKey,
+      appId,
+      installation: opts.installation,
+      pr: opts.prNumber,
+      repo: opts.base,
+      text: buildStatus.text,
+      summary: buildStatus.summary,
+      conclusion: buildStatus.conclusion,
+      title: `🦉 OwlBot - ${buildStatus.summary}`,
+      detailsURL: buildStatus.detailsURL,
+    },
+    octokit
+  );
+
+  await core.updatePullRequestAfterPostProcessor(
+    opts.owner,
+    opts.repo,
+    opts.prNumber,
+    octokit
+  );
 };

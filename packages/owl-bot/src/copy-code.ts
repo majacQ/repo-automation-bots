@@ -14,7 +14,6 @@
 
 import {promisify} from 'util';
 import {readFile} from 'fs';
-import * as proc from 'child_process';
 import {
   owlBotYamlPath,
   owlBotYamlFromText,
@@ -29,29 +28,16 @@ import {OctokitType, OctokitFactory} from './octokit-util';
 import tmp from 'tmp';
 import glob from 'glob';
 import {GithubRepo} from './github-repo';
+import {OWL_BOT_COPY} from './core';
+import {newCmd} from './cmd';
+import {createPullRequestFromLastCommit} from './create-pr';
 
 // This code generally uses Sync functions because:
 // 1. None of our current designs including calling this code from a web
-//    server or other multi-processing enviornment.
+//    server or other multi-processing environment.
 // 2. Calling sync functions yields simpler code.
 
 const readFileAsync = promisify(readFile);
-
-// Creates a function that first prints, then executes a shell command.
-export type Cmd = (
-  command: string,
-  options?: proc.ExecSyncOptions | undefined
-) => Buffer;
-export function newCmd(logger = console): Cmd {
-  const cmd = (
-    command: string,
-    options?: proc.ExecSyncOptions | undefined
-  ): Buffer => {
-    logger.info(command);
-    return proc.execSync(command, options);
-  };
-  return cmd;
-}
 
 /**
  * Composes a link to the source commit that triggered the copy.
@@ -63,6 +49,9 @@ function sourceLinkFrom(sourceCommitHash: string): string {
 /**
  * Copies the code from googleapis-gen to the dest repo, and creates a
  * pull request.
+ * @param sourceRepo: the source repository, either a local path or googleapis/googleapis-gen
+ * @param sourceRepoCommit: the commit from which to copy code. Empty means the most recent commit.
+ * @param destRepo: the destination repository, either a local path or a github path like googleapis/nodejs-vision.
  */
 export async function copyCodeAndCreatePullRequest(
   sourceRepo: string,
@@ -80,7 +69,9 @@ export async function copyCodeAndCreatePullRequest(
   const cmd = newCmd(logger);
 
   // Clone the dest repo.
-  const cloneUrl = destRepo.getCloneUrl();
+  const cloneUrl = destRepo.getCloneUrl(
+    await octokitFactory.getGitHubShortLivedAccessToken()
+  );
   cmd(`git clone --single-branch "${cloneUrl}" ${destDir}`);
 
   // Check out a dest branch.
@@ -115,7 +106,7 @@ ${err}`,
     logger.error(`Created issue ${issue.data.html_url}`);
     return; // Success because we don't want to retry.
   }
-  await copyCode(
+  const {sourceCommitHash, commitMsgPath} = await copyCode(
     sourceRepo,
     sourceRepoCommitHash,
     destDir,
@@ -123,44 +114,27 @@ ${err}`,
     yaml,
     logger
   );
+  cmd('git add -A', {cwd: destDir});
+  cmd(`git commit -F "${commitMsgPath}" --allow-empty`, {cwd: destDir});
 
   // Check for existing pull request one more time before we push.
   const token = await octokitFactory.getGitHubShortLivedAccessToken();
   // Octokit token may have expired; refresh it.
   const octokit = await octokitFactory.getShortLivedOctokit(token);
-  if (await copyExists(octokit, destRepo, sourceRepoCommitHash)) {
+  if (await copyExists(octokit, destRepo, sourceCommitHash)) {
     return; // Mid-air collision!
   }
 
-  const githubRepo = await octokit.repos.get({owner, repo});
-
-  // Push to origin.
-  const pushUrl = destRepo.getCloneUrl(token);
-  cmd(`git remote set-url origin ${pushUrl}`, {cwd: destDir});
-  cmd(`git push origin ${destBranch}`, {cwd: destDir});
-
-  // Use the commit's subject and body as the pull request's title and body.
-  const title: string = cmd('git log -1 --format=%s', {
-    cwd: destDir,
-  })
-    .toString('utf8')
-    .trim();
-  const body: string = cmd('git log -1 --format=%b', {
-    cwd: destDir,
-  })
-    .toString('utf8')
-    .trim();
-
-  // Create a pull request.
-  const pull = await octokit.pulls.create({
+  await createPullRequestFromLastCommit(
     owner,
     repo,
-    title,
-    body,
-    head: destBranch,
-    base: githubRepo.data.default_branch,
-  });
-  logger.info(`Created pull request ${pull.data.html_url}`);
+    destDir,
+    destBranch,
+    destRepo.getCloneUrl(token),
+    [OWL_BOT_COPY],
+    octokit,
+    logger
+  );
 }
 
 /**
@@ -207,10 +181,15 @@ export function toLocalRepo(
  *
  * @param sourceRepo usually 'googleapis/googleapis-gen';  May also be a local path
  *   to a git repo directory.
- * @param sourceCommitHash the commit hash to copy from googleapis-gen.
+ * @param sourceCommitHash the commit hash to copy from googleapis-gen; pass
+ *   the empty string to use the most recent commit hash in sourceRepo.
  * @param destDir the locally checkout out repo with an .OwlBot.yaml file.
  * @param workDir a working directory where googleapis-gen will be cloned.
  * @param yaml the yaml file loaded from the destDir
+ * @returns the commit hash from which code was copied. That will match sourceCommitHash
+ *    parameter if it was provided.  If not, it will be the most recent commit from
+ *    the source repo.  Also returns the path to the text file to use as a
+ *    commit message for a pull request.
  */
 export async function copyCode(
   sourceRepo: string,
@@ -219,11 +198,17 @@ export async function copyCode(
   workDir: string,
   yaml: OwlBotYaml,
   logger = console
-) {
+): Promise<{sourceCommitHash: string; commitMsgPath: string}> {
   const cmd = newCmd(logger);
   const sourceDir = toLocalRepo(sourceRepo, workDir, logger);
   // Check out the specific hash we want to copy from.
-  cmd(`git checkout ${sourceCommitHash}`, {cwd: sourceDir});
+  if (sourceCommitHash) {
+    cmd(`git checkout ${sourceCommitHash}`, {cwd: sourceDir});
+  } else {
+    sourceCommitHash = cmd('git log -1 --format=%H', {cwd: sourceDir})
+      .toString('utf8')
+      .trim();
+  }
 
   copyDirs(sourceDir, destDir, yaml, logger);
 
@@ -235,8 +220,8 @@ export async function copyCode(
   const sourceLink = sourceLinkFrom(sourceCommitHash);
   commitMsg += `Source-Link: ${sourceLink}\n`;
   fs.writeFileSync(commitMsgPath, commitMsg);
-  cmd('git add -A', {cwd: destDir});
-  cmd(`git commit -F "${commitMsgPath}" --allow-empty`, {cwd: destDir});
+  logger.log(`Wrote commit message to ${commitMsgPath}`);
+  return {sourceCommitHash, commitMsgPath};
 }
 
 // returns undefined instead of throwing an exception.
@@ -278,7 +263,11 @@ export function copyDirs(
   for (const rmDest of yaml['deep-remove-regex'] ?? []) {
     if (rmDest && stat(destDir)) {
       const rmRegExp = toFrontMatchRegExp(rmDest);
-      const allDestPaths = glob.sync('**', {cwd: destDir});
+      const allDestPaths = glob.sync('**', {
+        cwd: destDir,
+        dot: true,
+        ignore: ['.git', '.git/**'],
+      });
       const matchingDestPaths = allDestPaths.filter(path =>
         rmRegExp.test('/' + path)
       );
@@ -291,9 +280,10 @@ export function copyDirs(
   // Remove files first.
   for (let deadPath of deadPaths) {
     deadPath = path.join(destDir, deadPath);
-    if (stat(deadPath)?.isDirectory()) {
+    const deadStat = stat(deadPath);
+    if (deadStat?.isDirectory()) {
       deadDirs.push(deadPath);
-    } else {
+    } else if (deadStat) {
       logger.info(`rm  ${deadPath}`);
       fs.rmSync(deadPath);
     }
@@ -311,7 +301,11 @@ export function copyDirs(
   // Copy the files from source to dest.
   for (const deepCopy of yaml['deep-copy-regex'] ?? []) {
     const regExp = toFrontMatchRegExp(deepCopy.source);
-    const allSourcePaths = glob.sync('**', {cwd: sourceDir});
+    const allSourcePaths = glob.sync('**', {
+      cwd: sourceDir,
+      dot: true,
+      ignore: ['.git', '.git/**'],
+    });
     const sourcePathsToCopy = allSourcePaths.filter(path =>
       regExp.test('/' + path)
     );

@@ -13,14 +13,20 @@
 // limitations under the License.
 
 import {describe, it, beforeEach, afterEach} from 'mocha';
+import {resolve} from 'path';
 import nock from 'nock';
 // eslint-disable-next-line node/no-extraneous-import
 import {Probot, createProbot, ProbotOctokit} from 'probot';
+import {PullRequestOpenedEvent} from '@octokit/webhooks-types';
 import {promises as fs} from 'fs';
-import {handler, configFileName} from '../src/bot';
+import yaml from 'js-yaml';
+import * as botConfigModule from '@google-automations/bot-config-utils';
 import assert from 'assert';
 import * as sinon from 'sinon';
 import {logger} from 'gcf-utils';
+
+import {handler} from '../src/bot';
+import {CONFIG_FILE_NAME} from '../src/config';
 
 nock.disableNetConnect();
 
@@ -37,14 +43,6 @@ function nockUpdateTeamMembership(team: string, org: string, repo: string) {
   return nock('https://api.github.com')
     .put(`/orgs/${org}/teams/${team}/repos/${org}/${repo}`)
     .reply(200);
-}
-
-function nockConfig404(org = 'googleapis', repo = 'api-common-java') {
-  return nock('https://api.github.com')
-    .get(`/repos/${org}/${repo}/contents/.github%2F${configFileName}`)
-    .reply(404)
-    .get(`/repos/${org}/.github/contents/.github%2F${configFileName}`)
-    .reply(404);
 }
 
 function nockUpdateRepoSettings(
@@ -81,6 +79,7 @@ function nockUpdateBranchProtection(
         strict: requireUpToDateBranch,
       },
       enforce_admins: true,
+      required_linear_history: true,
       restrictions: null,
     })
     .reply(200);
@@ -88,7 +87,8 @@ function nockUpdateBranchProtection(
 
 async function receive(org: string, repo: string, cronOrg?: string) {
   await probot.receive({
-    name: 'schedule.repository' as '*',
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    name: 'schedule.repository' as any,
     payload: {
       repository: {
         name: repo,
@@ -100,14 +100,24 @@ async function receive(org: string, repo: string, cronOrg?: string) {
         login: org,
       },
       cron_org: cronOrg || org,
-    },
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any,
     id: 'abc123',
   });
+}
+
+const fixturesPath = resolve(__dirname, '../../test/fixtures');
+
+async function loadConfig(configFile: string) {
+  return yaml.load(
+    await fs.readFile(resolve(fixturesPath, configFile), 'utf-8')
+  );
 }
 
 const sandbox = sinon.createSandbox();
 
 describe('Sync repo settings', () => {
+  let getConfigStub: sinon.SinonStub;
   beforeEach(() => {
     probot = createProbot({
       overrides: {
@@ -122,26 +132,12 @@ describe('Sync repo settings', () => {
     sandbox.stub(logger, 'error').throwsArg(0);
     sandbox.stub(logger, 'info');
     sandbox.stub(logger, 'debug');
+    getConfigStub = sandbox.stub(botConfigModule, 'getConfig');
   });
 
   afterEach(() => {
     sandbox.restore();
     nock.cleanAll();
-  });
-
-  it('should ignore repos in ignored repos in required-checks.json', async () => {
-    const repo = 'gax-ruby';
-    const scopes = [
-      nockConfig404(org, repo),
-      nockLanguagesList(org, repo, {ruby: 1}),
-      nockUpdateTeamMembership('yoshi-admins', org, repo),
-      nockUpdateTeamMembership('yoshi-ruby-admins', org, repo),
-      nockUpdateTeamMembership('yoshi-ruby', org, repo),
-      nockUpdateTeamMembership('cloud-dpe', org, repo),
-      nockUpdateTeamMembership('cloud-devrel-pgm', org, repo),
-    ];
-    await receive(org, repo);
-    scopes.forEach(x => x.done());
   });
 
   it('should skip for the wrong context', async () => {
@@ -151,27 +147,9 @@ describe('Sync repo settings', () => {
   it('should ignore repos not represented in required-checks.json', async () => {
     const org = 'Codertocat';
     const repo = 'Hello-World';
+    getConfigStub.resolves(null);
     const scopes = [
-      nockConfig404(org, repo),
       nockLanguagesList(org, repo, {kotlin: 1}),
-      nockUpdateTeamMembership('cloud-dpe', org, repo),
-      nockUpdateTeamMembership('cloud-devrel-pgm', org, repo),
-    ];
-    await receive(org, repo);
-    scopes.forEach(s => s.done());
-  });
-
-  it('should override master branch protection if the repo is overridden', async () => {
-    const repo = 'python-bigtable';
-    const scopes = [
-      nockConfig404(org, repo),
-      nockLanguagesList(org, repo, {python: 1}),
-      nockUpdateRepoSettings(repo, true, true),
-      nockUpdateBranchProtection(repo, ['Kokoro', 'cla/google'], false, false),
-      nockUpdateTeamMembership('yoshi-admins', org, repo),
-      nockUpdateTeamMembership('yoshi-python-admins', org, repo),
-      nockUpdateTeamMembership('yoshi-python', org, repo),
-      nockUpdateTeamMembership('python-samples-owners', org, repo),
       nockUpdateTeamMembership('cloud-dpe', org, repo),
       nockUpdateTeamMembership('cloud-devrel-pgm', org, repo),
     ];
@@ -181,8 +159,8 @@ describe('Sync repo settings', () => {
 
   it('should update settings for a known repository', async () => {
     const repo = 'nodejs-dialogflow';
+    getConfigStub.resolves(null);
     const scopes = [
-      nockConfig404(org, repo),
       nockLanguagesList(org, repo, {
         groovy: 33,
         typescript: 100,
@@ -202,6 +180,7 @@ describe('Sync repo settings', () => {
           'test (15)',
           'cla/google',
           'windows',
+          'OwlBot Post Processor',
         ],
         true,
         true
@@ -217,10 +196,8 @@ describe('Sync repo settings', () => {
   });
 
   it('should nope out if github returns no languages', async () => {
-    const scopes = [
-      nockConfig404('Codertocat', 'Hello-World'),
-      nockLanguagesList('Codertocat', 'Hello-World', {}),
-    ];
+    getConfigStub.resolves(null);
+    const scopes = [nockLanguagesList('Codertocat', 'Hello-World', {})];
     await receive('Codertocat', 'Hello-World');
     scopes.forEach(x => x.done());
   });
@@ -228,11 +205,8 @@ describe('Sync repo settings', () => {
   it('should use localized config if available', async () => {
     const org = 'googleapis';
     const repo = 'fake';
-    const content = await fs.readFile('./test/fixtures/localConfig.yaml');
+    getConfigStub.resolves(await loadConfig('localConfig.yaml'));
     const scopes = [
-      nock('https://api.github.com')
-        .get(`/repos/${org}/${repo}/contents/.github%2F${configFileName}`)
-        .reply(200, content),
       nockUpdateRepoSettings(repo, false, true),
       nockUpdateBranchProtection(repo, ['check1', 'check2'], false, true),
       nockUpdateTeamMembership('team1', org, repo),
@@ -246,13 +220,10 @@ describe('Sync repo settings', () => {
   it('should use localized config and skip branch protection', async () => {
     const org = 'googleapis';
     const repo = 'fake';
-    const content = await fs.readFile(
-      './test/fixtures/localConfigWithoutBranchProtection.yaml'
+    getConfigStub.resolves(
+      await loadConfig('localConfigWithoutBranchProtection.yaml')
     );
     const scopes = [
-      nock('https://api.github.com')
-        .get(`/repos/${org}/${repo}/contents/.github%2F${configFileName}`)
-        .reply(200, content),
       nockUpdateRepoSettings(repo, false, true),
       nockUpdateTeamMembership('team1', org, repo),
       nockUpdateTeamMembership('cloud-dpe', org, repo),
@@ -277,19 +248,13 @@ describe('Sync repo settings', () => {
         .reply(200, [
           {
             sha: fileSha,
-            filename: `.github/${configFileName}`,
+            filename: `.github/${CONFIG_FILE_NAME}`,
             status: 'added',
           },
         ]),
       nock('https://api.github.com')
         .get(`/repos/${org}/${repo}/git/blobs/${fileSha}`)
         .reply(200, {content}),
-      nock('https://api.github.com')
-        .post(`/repos/${org}/${repo}/check-runs`, body => {
-          assert.strictEqual(body.conclusion, 'success');
-          return true;
-        })
-        .reply(200),
     ];
     await probot.receive({
       name: 'pull_request',
@@ -304,13 +269,13 @@ describe('Sync repo settings', () => {
         organization: {
           login: org,
         },
-        number: 1,
         pull_request: {
+          number: 1,
           head: {
             sha: headSha,
           },
         },
-      },
+      } as PullRequestOpenedEvent,
       id: 'abc123',
     });
     scopes.forEach(x => x.done());
@@ -331,7 +296,7 @@ describe('Sync repo settings', () => {
         .reply(200, [
           {
             sha: fileSha,
-            filename: `.github/${configFileName}`,
+            filename: `.github/${CONFIG_FILE_NAME}`,
             status: 'added',
           },
         ]),
@@ -359,13 +324,13 @@ describe('Sync repo settings', () => {
         organization: {
           login: org,
         },
-        number: 1,
         pull_request: {
+          number: 1,
           head: {
             sha: headSha,
           },
         },
-      },
+      } as PullRequestOpenedEvent,
       id: 'abc123',
     });
     scopes.forEach(x => x.done());
@@ -386,7 +351,7 @@ describe('Sync repo settings', () => {
         .reply(200, [
           {
             sha: fileSha,
-            filename: `.github/${configFileName}`,
+            filename: `.github/${CONFIG_FILE_NAME}`,
             status: 'added',
           },
         ]),
@@ -413,13 +378,13 @@ describe('Sync repo settings', () => {
         organization: {
           login: org,
         },
-        number: 1,
         pull_request: {
+          number: 1,
           head: {
             sha: headSha,
           },
         },
-      },
+      } as PullRequestOpenedEvent,
       id: 'abc123',
     });
     scopes.forEach(x => x.done());
@@ -431,7 +396,7 @@ describe('Sync repo settings', () => {
     await probot.receive({
       name: 'push',
       payload: {
-        ref: 'refs/head/main',
+        ref: 'refs/heads/main',
         repository: {
           name: repo,
           owner: {
@@ -443,7 +408,8 @@ describe('Sync repo settings', () => {
           login: org,
         },
         commits: [],
-      },
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } as any,
       id: 'abc123',
     });
   });
@@ -454,7 +420,7 @@ describe('Sync repo settings', () => {
     await probot.receive({
       name: 'push',
       payload: {
-        ref: 'refs/head/not-default-lol',
+        ref: 'refs/heads/not-default-lol',
         repository: {
           name: repo,
           owner: {
@@ -466,7 +432,8 @@ describe('Sync repo settings', () => {
           login: org,
         },
         commits: [],
-      },
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } as any,
       id: 'abc123',
     });
   });
@@ -474,8 +441,8 @@ describe('Sync repo settings', () => {
   it('should sync settings for pushes that modify the config', async () => {
     const org = 'Codertocat';
     const repo = 'Hello-World';
+    getConfigStub.resolves(null);
     const scopes = [
-      nockConfig404(org, repo),
       nockLanguagesList(org, repo, {kotlin: 1}),
       nockUpdateTeamMembership('cloud-dpe', org, repo),
       nockUpdateTeamMembership('cloud-devrel-pgm', org, repo),
@@ -483,7 +450,7 @@ describe('Sync repo settings', () => {
     await probot.receive({
       name: 'push',
       payload: {
-        ref: 'refs/head/main',
+        ref: 'refs/heads/main',
         repository: {
           name: repo,
           owner: {
@@ -496,10 +463,11 @@ describe('Sync repo settings', () => {
         },
         commits: [
           {
-            added: [`.github/${configFileName}`],
+            added: [`.github/${CONFIG_FILE_NAME}`],
           },
         ],
-      },
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } as any,
       id: 'abc123',
     });
     scopes.forEach(s => s.done());

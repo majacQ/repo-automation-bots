@@ -28,14 +28,15 @@ const fixturesPath = resolve(__dirname, '../../test/fixtures');
 
 // Test app
 const app = (app: Probot) => {
-  app.on('issues.opened', async context => {
+  app.on('issues', async context => {
     await addOrUpdateIssueComment(
       context.octokit,
       context.payload.repository.owner.login,
       context.payload.repository.name,
       context.payload.issue.number,
       context.payload.installation!.id,
-      'test comment'
+      'test comment',
+      context.payload.issue.title === 'onlyUpdate'
     );
   });
 };
@@ -73,7 +74,25 @@ describe('gcf-utils', () => {
         .reply(200);
 
       await probot.receive({
-        name: 'issues.opened',
+        name: 'issues',
+        payload,
+        id: 'test',
+      });
+      requests.done();
+    });
+    it('does not create a comment', async () => {
+      const payload = require(resolve(
+        fixturesPath,
+        './issue_only_update_event'
+      ));
+      const requests = nock('https://api.github.com')
+        .get(
+          '/repos/tmatsuo/python-docs-samples/issues/10/comments?per_page=50'
+        )
+        .reply(200, []);
+
+      await probot.receive({
+        name: 'issues',
         payload,
         id: 'test',
       });
@@ -97,7 +116,7 @@ describe('gcf-utils', () => {
         .reply(200);
 
       await probot.receive({
-        name: 'issues.opened',
+        name: 'issues',
         payload,
         id: 'test',
       });
